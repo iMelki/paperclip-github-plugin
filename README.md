@@ -191,29 +191,17 @@ Additional behavior:
 
 The plugin is designed to avoid persisting raw credentials in plugin state.
 
-- GitHub tokens saved through the UI are stored as per-company Paperclip secret references.
-- Paperclip board access tokens are also stored as per-company secret references.
+- GitHub tokens saved through the UI are stored as per-company Paperclip secret references. The company config retains its legacy map entry for migration and records an object-shaped `githubTokenBinding` for host-authorized secret resolution.
+- Paperclip board access tokens are also stored as per-company secret references with an object-shaped `paperclipBoardApiTokenBinding` for host-authorized secret resolution.
 - The settings UI also keeps lightweight non-secret identity labels for those saved connections, so later visits can still show who each company GitHub token and board access are connected as.
 - On authenticated deployments, any selected propagation agents receive `GITHUB_TOKEN` as an agent env secret-ref binding that points at the same saved GitHub token secret instead of a copied raw token.
-- The worker resolves those secret references at runtime instead of storing raw tokens in plugin state.
+- The worker resolves those bindings at runtime with the active company and config path instead of storing or falling back to raw tokens.
 - On authenticated Paperclip deployments, sync is blocked until the relevant company has connected Paperclip board access.
 - KPI API route requests must include `Authorization: Bearer <PAPERCLIP_API_KEY>` from an agent run; the Paperclip host authenticates the token and supplies the agent company before the worker records any metric event.
 
-### Optional worker-local token file
+### Worker credential source
 
-If Paperclip-managed secrets are not available, the worker can read a local fallback file at `${PAPERCLIP_HOME:-~/.paperclip}/plugins/github-sync/config.json`:
-
-```json
-{
-  "githubToken": "ghp_your_token_here"
-}
-```
-
-Notes:
-
-- This file is read by the worker only.
-- The raw token is never persisted back into plugin state or plugin config.
-- A GitHub token secret saved through the settings UI takes precedence over the local file.
+The worker only reads Paperclip-managed secret-reference configuration. It does not read or accept a raw local `githubToken` fallback.
 
 ### Worker-facing Paperclip API URL
 
@@ -326,7 +314,7 @@ curl -X POST "${PAPERCLIP_API_URL%/}/api/plugins/paperclip-github-plugin/api/iss
 ## Troubleshooting
 
 - If an older GitHub Sync build fails upgrade with `requires host version 2026.427.0 or newer, but this server is running 0.0.0`, upgrade to a build that removes the strict manifest host-version gate. The host is reporting a development-version sentinel, so the plugin now relies on declared capabilities and runtime fallbacks instead.
-- If setup is reported as incomplete, confirm that a GitHub token has been saved or that `${PAPERCLIP_HOME:-~/.paperclip}/plugins/github-sync/config.json` contains `githubToken`, and make sure at least one mapping has a created Paperclip project or at least one Paperclip issue has been linked to GitHub.
+- If setup is reported as incomplete, confirm that a GitHub token has been saved in GitHub Sync settings for the active company, then make sure at least one mapping has a created Paperclip project or at least one Paperclip issue has been linked to GitHub.
 - If Paperclip says board access is required, open plugin settings inside the affected company and complete the Paperclip board access flow before retrying sync.
 - If GitHub Sync agent tools fail with `403 {"error":"Board access required"}` on `/api/plugins/tools` or `/api/plugins/tools/execute`, the current Paperclip host rejected the request before the plugin worker ran. Re-run from a board-authenticated session or agent run that has board access to the target company.
 - If a KPI API route call is rejected, make sure the request includes `Authorization: Bearer ${PAPERCLIP_API_KEY}`, that the token is still valid for the current run, and that any `companyId` in the payload matches the calling agent's company.

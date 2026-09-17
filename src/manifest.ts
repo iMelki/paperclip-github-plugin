@@ -64,12 +64,34 @@ export const manifest: PaperclipPluginManifestV1 = {
           type: 'string'
         }
       },
+      githubTokenBinding: {
+        type: 'object',
+        title: 'GitHub Token Secret Binding',
+        properties: {
+          type: { const: 'secret_ref' },
+          secretId: { type: 'string' },
+          version: { type: 'string' }
+        },
+        required: ['type', 'secretId'],
+        additionalProperties: false
+      },
       paperclipBoardApiTokenRefs: {
         type: 'object',
         title: 'Paperclip Board Token Secrets',
         additionalProperties: {
           type: 'string'
         }
+      },
+      paperclipBoardApiTokenBinding: {
+        type: 'object',
+        title: 'Paperclip Board Token Secret Binding',
+        properties: {
+          type: { const: 'secret_ref' },
+          secretId: { type: 'string' },
+          version: { type: 'string' }
+        },
+        required: ['type', 'secretId'],
+        additionalProperties: false
       },
       paperclipApiBaseUrl: {
         type: 'string',

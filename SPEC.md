@@ -7,7 +7,7 @@ GitHub Sync is a Paperclip plugin for registering one or more GitHub repositorie
 The plugin MUST provide a settings page inside Paperclip where an operator can configure:
 
 - a GitHub token stored as a company-scoped Paperclip secret reference
-- an optional external config file at `${PAPERCLIP_HOME:-~/.paperclip}/plugins/github-sync/config.json` for worker-only global values such as a raw `githubToken`
+- no raw worker-local `githubToken` fallback
 - Paperclip board access, which is optional on unauthenticated deployments and required when the Paperclip deployment reports `deploymentMode: "authenticated"`
 - on authenticated deployments, a company-scoped multi-select of agents that should receive `GITHUB_TOKEN` propagation from the saved GitHub token secret
 - one or more GitHub repository mappings
@@ -36,16 +36,15 @@ The settings page MUST allow saving mappings and triggering a manual sync.
 
 - The raw GitHub token MUST NOT be persisted in plugin state.
 - Saving a token from the settings UI MUST create or reuse a company secret through the Paperclip host API.
-- The plugin MUST persist only the resulting secret UUID, keyed by company, in plugin instance config.
-- The worker MUST resolve that secret UUID at runtime via `ctx.secrets.resolve(...)`.
+- The plugin MUST preserve the legacy company-keyed secret UUID map for migration, and MUST mirror the active company's GitHub token as an object-shaped `githubTokenBinding` with `type: "secret_ref"` and `secretId` in company-scoped plugin config.
+- The worker MUST resolve that binding at runtime through the Paperclip company-scoped `ctx.secrets.resolve({ secretRef, companyId, configPath })` contract; it MUST NOT fall back to a raw token value.
 - The plugin MAY persist lightweight non-secret display metadata such as the validated GitHub login alongside the saved GitHub token secret ref so hosted UI can keep connected-state copy consistent across refreshes without resolving the secret.
 - When authenticated deployment settings select agents for GitHub token propagation, the hosted settings UI MUST patch those agents through the host API so `adapterConfig.env.GITHUB_TOKEN` points at that same secret UUID instead of copying the raw token value.
 - When an authenticated deployment settings save removes an agent from that propagation allowlist, the hosted settings UI SHOULD remove `adapterConfig.env.GITHUB_TOKEN` only when that binding still points at the plugin-managed secret UUID, so unrelated manual agent env settings are not clobbered.
-- If `${PAPERCLIP_HOME:-~/.paperclip}/plugins/github-sync/config.json` exists and contains a string `githubToken`, the worker MUST treat it as a worker-only fallback source for the GitHub token without persisting or returning that raw token.
 - The raw Paperclip board API token MUST NOT be persisted in plugin state.
-- Connecting Paperclip board access from the settings UI MUST create or reuse a company secret through the Paperclip host API and MUST persist only the resulting secret UUID, keyed by company in plugin state and mirrored into plugin instance config so the worker can resolve it.
+- Connecting Paperclip board access from the settings UI MUST create or reuse a company secret through the Paperclip host API and MUST persist only the resulting secret UUID, keyed by company in plugin state and mirrored into company-scoped plugin config as both the legacy map entry and an object-shaped `paperclipBoardApiTokenBinding` so the worker can resolve it.
 - The plugin MAY persist lightweight company-scoped non-secret display metadata such as the connected board identity label alongside the saved board token secret ref so hosted UI can keep connected-state copy consistent across refreshes without resolving the secret.
-- The worker MUST resolve the saved Paperclip board token secret at runtime via `ctx.secrets.resolve(...)` before making direct Paperclip REST calls for that company, and MUST treat plugin config as the worker-readable source of truth for those secret refs.
+- The worker MUST resolve the saved Paperclip board token at runtime using its company-scoped object binding before making direct Paperclip REST calls for that company, and MUST treat plugin config as the worker-readable source of truth for those secret refs.
 
 ## Synchronization behavior
 

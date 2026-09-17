@@ -20,6 +20,8 @@ import {
   mergePluginConfig,
   normalizePaperclipApiBaseUrl,
   normalizePluginConfig,
+  pluginConfigPath,
+  pluginConfigSaveBody,
   resolvePaperclipApiBaseUrlForPluginAction
 } from './plugin-config.ts';
 import {
@@ -5840,7 +5842,10 @@ async function fetchPluginDataResult<T>(params: {
   return response.data;
 }
 
-async function syncTrustedPaperclipApiBaseUrl(pluginId: string | null): Promise<string | undefined> {
+async function syncTrustedPaperclipApiBaseUrl(
+  pluginId: string | null,
+  companyId: string | null | undefined
+): Promise<string | undefined> {
   const resolvedPluginId = await resolveCurrentPluginId(pluginId);
   if (!resolvedPluginId) {
     throw new Error(
@@ -5848,7 +5853,11 @@ async function syncTrustedPaperclipApiBaseUrl(pluginId: string | null): Promise<
     );
   }
 
-  const currentConfigResponse = await fetchJson<PluginConfigResponse | null>(`/api/plugins/${resolvedPluginId}/config`);
+  if (!companyId) {
+    throw new Error('Company context is required to read plugin configuration.');
+  }
+
+  const currentConfigResponse = await fetchJson<PluginConfigResponse | null>(pluginConfigPath(resolvedPluginId, companyId));
   const currentConfig = normalizePluginConfig(currentConfigResponse?.configJson);
   const paperclipApiBaseUrl = resolvePaperclipApiBaseUrlForPluginAction(currentConfig, getPaperclipApiBrowserOrigin());
   if (!paperclipApiBaseUrl) {
@@ -6841,8 +6850,8 @@ async function resolveOrCreateCompanySecret(companyId: string, name: string, val
   });
 }
 
-async function patchPluginConfig(pluginId: string, patch: Record<string, unknown>): Promise<void> {
-  const currentConfigResponse = await fetchJson<PluginConfigResponse | null>(`/api/plugins/${pluginId}/config`);
+async function patchPluginConfig(companyId: string, pluginId: string, patch: Record<string, unknown>): Promise<void> {
+  const currentConfigResponse = await fetchJson<PluginConfigResponse | null>(pluginConfigPath(pluginId, companyId));
   const currentConfig = normalizePluginConfig(currentConfigResponse?.configJson);
   const nextConfig = mergePluginConfig(currentConfig, patch);
 
@@ -6852,9 +6861,7 @@ async function patchPluginConfig(pluginId: string, patch: Record<string, unknown
 
   await fetchJson(`/api/plugins/${pluginId}/config`, {
     method: 'POST',
-    body: JSON.stringify({
-      configJson: nextConfig
-    })
+    body: JSON.stringify(pluginConfigSaveBody(companyId, nextConfig))
   });
 }
 
@@ -11457,10 +11464,9 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
           throw new Error('Plugin id is required to finish syncing Paperclip board access into plugin config.');
         }
 
-        await patchPluginConfig(pluginId, {
-          paperclipBoardApiTokenRefs: {
-            [companyId]: secretRef
-          }
+        await patchPluginConfig(companyId, pluginId, {
+          paperclipBoardApiTokenRefs: { [companyId]: secretRef },
+          paperclipBoardApiTokenBinding: { type: 'secret_ref', secretId: secretRef }
         });
 
         if (cancelled) {
@@ -12020,9 +12026,10 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         throw new Error('Plugin id is required to propagate the GitHub token to selected agents.');
       }
 
-      const currentConfigResponse = await fetchJson<PluginConfigResponse | null>(`/api/plugins/${pluginId}/config`);
+      const currentConfigResponse = await fetchJson<PluginConfigResponse | null>(pluginConfigPath(pluginId, companyId));
       const normalizedConfig = normalizePluginConfig(currentConfigResponse?.configJson);
-      githubTokenSecretRef = normalizedConfig.githubTokenRefs?.[companyId];
+      githubTokenSecretRef = normalizedConfig.githubTokenBinding?.secretId
+        ?? normalizedConfig.githubTokenRefs?.[companyId];
     }
 
     if (!githubTokenSecretRef) {
@@ -12083,10 +12090,9 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       const secretName = `github_sync_${companyId.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`;
       const secret = await resolveOrCreateCompanySecret(companyId, secretName, trimmedToken);
 
-      await patchPluginConfig(pluginId, {
-        githubTokenRefs: {
-          [companyId]: secret.id
-        }
+      await patchPluginConfig(companyId, pluginId, {
+        githubTokenRefs: { [companyId]: secret.id },
+        githubTokenBinding: { type: 'secret_ref', secretId: secret.id }
       });
       await saveRegistration({
         companyId,
@@ -12190,10 +12196,9 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       const secretName = `paperclip_board_api_${companyId.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`;
       const secret = await resolveOrCreateCompanySecret(companyId, secretName, boardApiToken);
 
-      await patchPluginConfig(pluginId, {
-        paperclipBoardApiTokenRefs: {
-          [companyId]: secret.id
-        }
+      await patchPluginConfig(companyId, pluginId, {
+        paperclipBoardApiTokenRefs: { [companyId]: secret.id },
+        paperclipBoardApiTokenBinding: { type: 'secret_ref', secretId: secret.id }
       });
       await updateBoardAccess({
         companyId,
@@ -12303,7 +12308,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         ? normalizedPaperclipApiBaseUrlDraft ?? ''
         : '';
 
-      await patchPluginConfig(pluginId, {
+      await patchPluginConfig(companyId, pluginId, {
         paperclipApiBaseUrl: nextConfiguredPaperclipApiBaseUrl
       });
       const result = await saveRegistration({
@@ -12381,7 +12386,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         throw new Error(syncSetupMessage);
       }
 
-      const trustedPaperclipApiBaseUrl = await syncTrustedPaperclipApiBaseUrl(pluginIdFromLocation);
+      const trustedPaperclipApiBaseUrl = await syncTrustedPaperclipApiBaseUrl(pluginIdFromLocation, hostContext.companyId);
       const result = await runSyncNow({
         ...(hostContext.companyId ? { companyId: hostContext.companyId } : {}),
         ...(trustedPaperclipApiBaseUrl ? { paperclipApiBaseUrl: trustedPaperclipApiBaseUrl } : {})
@@ -13560,7 +13565,7 @@ export function GitHubSyncDashboardWidget(): React.JSX.Element {
         throw new Error(syncSetupMessage);
       }
 
-      const trustedPaperclipApiBaseUrl = await syncTrustedPaperclipApiBaseUrl(pluginIdFromLocation);
+      const trustedPaperclipApiBaseUrl = await syncTrustedPaperclipApiBaseUrl(pluginIdFromLocation, hostContext.companyId);
       const result = await runSyncNow({
         ...(hostContext.companyId ? { companyId: hostContext.companyId } : {}),
         ...(trustedPaperclipApiBaseUrl ? { paperclipApiBaseUrl: trustedPaperclipApiBaseUrl } : {})
@@ -14563,7 +14568,7 @@ function useGitHubSyncButtonController(props: {
       }
 
       setRunningSync(true);
-      const trustedPaperclipApiBaseUrl = await syncTrustedPaperclipApiBaseUrl(pluginIdFromLocation);
+      const trustedPaperclipApiBaseUrl = await syncTrustedPaperclipApiBaseUrl(pluginIdFromLocation, props.companyId);
       const result = await runSyncNow({
         waitForCompletion: false,
         ...(props.companyId ? { companyId: props.companyId } : {}),
