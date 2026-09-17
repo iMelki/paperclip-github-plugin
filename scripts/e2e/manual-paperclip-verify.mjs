@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
+import { getNpxInvocation } from './npx-launcher.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..', '..');
@@ -79,12 +80,16 @@ function runCommand(command, args, options = {}) {
     quiet = false,
     ...spawnOptions
   } = options;
+  const invocation = command === 'npx'
+    ? getNpxInvocation(args)
+    : { command, args, windowsHide: false };
 
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, {
+    const child = spawn(invocation.command, invocation.args, {
       cwd: pluginRoot,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: invocation.windowsHide,
       ...spawnOptions
     });
 
@@ -708,11 +713,15 @@ async function main() {
   await ensureConfigFile(configPath);
   baseUrl = await readConfiguredBaseUrl(configPath);
 
-  serverProcess = spawn('npx', getPaperclipCommandArgs(['run', '--config', configPath, '--data-dir', dataDir]), {
+  const serverInvocation = getNpxInvocation(
+    getPaperclipCommandArgs(['run', '--config', configPath, '--data-dir', dataDir])
+  );
+  serverProcess = spawn(serverInvocation.command, serverInvocation.args, {
     cwd: pluginRoot,
     env,
     detached: true,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: serverInvocation.windowsHide
   });
   serverProcess.unref();
 

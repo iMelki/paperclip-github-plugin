@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
+import { getNpxInvocation } from './npx-launcher.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pluginRoot = resolve(__dirname, '..', '..');
@@ -63,11 +64,15 @@ function getPaperclipCommandArgs(args) {
 }
 
 function runCommand(command, args, options = {}) {
+  const invocation = command === 'npx'
+    ? getNpxInvocation(args)
+    : { command, args, windowsHide: false };
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, {
+    const child = spawn(invocation.command, invocation.args, {
       cwd: pluginRoot,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: invocation.windowsHide,
       ...options
     });
 
@@ -99,11 +104,15 @@ function runCommand(command, args, options = {}) {
 }
 
 function captureCommand(command, args, options = {}) {
+  const invocation = command === 'npx'
+    ? getNpxInvocation(args)
+    : { command, args, windowsHide: false };
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, {
+    const child = spawn(invocation.command, invocation.args, {
       cwd: pluginRoot,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: invocation.windowsHide,
       ...options
     });
 
@@ -854,11 +863,15 @@ async function main() {
   log(`Using ${seededRepositoryUrl} for manual GitHub link fixtures.`);
   baseUrl = await readConfiguredBaseUrl(configPath);
 
-  serverProcess = spawn('npx', getPaperclipCommandArgs(['run', '--config', configPath, '--data-dir', dataDir]), {
+  const serverInvocation = getNpxInvocation(
+    getPaperclipCommandArgs(['run', '--config', configPath, '--data-dir', dataDir])
+  );
+  serverProcess = spawn(serverInvocation.command, serverInvocation.args, {
     cwd: pluginRoot,
     env: serverEnv,
     detached: true,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: serverInvocation.windowsHide
   });
   serverProcess.unref();
 
