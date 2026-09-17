@@ -1,14 +1,94 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { strict as assert } from 'node:assert';
-import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
+import { getNpxInvocation } from '../scripts/e2e/npx-launcher.mjs';
 
 const execFileAsync = promisify(execFile);
 const RELEASE_UNDER_TEST = '2026.831.1';
 const PNPM_ACTION_SETUP_SHA_PATTERN = '[0-9a-f]{40}';
+
+function runProcess(command, args, options = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...options
+    });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', rejectPromise);
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolvePromise({ stdout, stderr });
+        return;
+      }
+
+      rejectPromise(new Error(`${command} exited with code ${code}: ${stderr}`));
+    });
+  });
+}
+
+test('npx e2e invocations run the bundled npm CLI directly on Windows and remain shell-free elsewhere', () => {
+  assert.deepEqual(
+    getNpxInvocation(['--version'], {
+      platform: 'win32',
+      nodeExecutable: 'C:\\node\\node.exe',
+      npxCliPath: 'C:\\node\\node_modules\\npm\\bin\\npx-cli.js'
+    }),
+    {
+      command: 'C:\\node\\node.exe',
+      args: ['C:\\node\\node_modules\\npm\\bin\\npx-cli.js', '--version'],
+      windowsHide: true
+    }
+  );
+  assert.deepEqual(
+    getNpxInvocation(['--version'], { platform: 'linux' }),
+    { command: 'npx', args: ['--version'], windowsHide: false }
+  );
+});
+
+test('Windows npx launcher round-trips special arguments without executing command syntax', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'paperclip-github-plugin-npx-launcher-'));
+  const probePath = join(tempDir, 'argv-probe.mjs');
+  const markerPath = join(tempDir, 'must-not-exist.txt');
+  const specialArgs = [
+    'path with spaces',
+    'literal&and',
+    'literal|pipe',
+    'literal%percent%',
+    'literal^caret',
+    'quoted"value',
+    'trailing-backslash\\',
+    `value & echo injected > "${markerPath}"`
+  ];
+
+  try {
+    await writeFile(probePath, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));\n');
+    const invocation = getNpxInvocation(specialArgs, {
+      platform: 'win32',
+      nodeExecutable: process.execPath,
+      npxCliPath: probePath
+    });
+    const { stdout } = await runProcess(invocation.command, invocation.args, {
+      windowsHide: invocation.windowsHide
+    });
+
+    assert.deepEqual(JSON.parse(stdout), specialArgs);
+    await assert.rejects(access(markerPath));
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
 
 test('build script reports missing local dependencies clearly when node_modules is absent', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'paperclip-github-plugin-build-no-deps-'));
