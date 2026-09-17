@@ -18,6 +18,7 @@ import { resolvePaperclipAuthControlsPolicy } from '../paperclip-health.ts';
 import { normalizeCompanyAssigneeOptionsResponse, type GitHubSyncAssigneeOption } from './assignees.ts';
 import { buildPaperclipUrl, fetchJson, fetchPaperclipHealth, resolveCliAuthPollUrl } from './http.ts';
 import {
+  buildCompanySecretCreateRequest,
   exposeGitHubTokenToPaperclipHost,
   HOST_GITHUB_TOKEN_SECRET_NAME,
   resolveOrCreateCompanySecret as resolveOrCreateCompanySecretRequest,
@@ -286,6 +287,7 @@ interface AgentToolAccessSummary {
   checkedAgentId?: string;
   checkedAgentName?: string;
   checkableAgentCount?: number;
+  needsBoardAccessRepair?: boolean;
 }
 
 interface GitHubSyncSettings {
@@ -6879,6 +6881,11 @@ function isPluginSecretReferencesDisabledError(error: unknown): boolean {
 }
 
 const PLUGIN_CONFIG_SECRET_KEY_PATTERN = /secret|token/iu;
+const PLUGIN_CONFIG_SECRET_REF_KEYS = new Set([
+  'githubTokenRefs',
+  'githubTokenCandidateRefs',
+  'paperclipBoardApiTokenRefs'
+]);
 
 function isPlainConfigRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -6923,6 +6930,79 @@ function stripPluginSecretRefConfig(config: GitHubSyncPluginConfig): GitHubSyncP
   return stripPluginSecretRefValue(config) as GitHubSyncPluginConfig;
 }
 
+function createCompanySecretCandidate(
+  companyId: string,
+  name: string,
+  value: string
+): Promise<CompanySecretSummary> {
+  const request = buildCompanySecretCreateRequest(companyId, name, value);
+  return fetchJson<CompanySecretSummary>(request.url, request.init);
+}
+
+function createGitHubTokenCandidateSecretName(companyId: string): string {
+  const normalizedCompanyId = companyId.replace(/[^a-z0-9]+/gi, '_').toLowerCase();
+  return `github_sync_${normalizedCompanyId}_candidate_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export async function stageValidateAndPromoteGitHubTokenCandidate(
+  input: {
+    companyId: string;
+    token: string;
+    createCandidateSecret: (companyId: string, name: string, token: string) => Promise<CompanySecretSummary>;
+    bindCandidate: (candidate: CompanySecretSummary) => Promise<void>;
+    validateCandidate: (input: { companyId: string; githubTokenCandidateRef: string }) => Promise<TokenValidationResult>;
+    promoteCandidate: (candidate: CompanySecretSummary, validation: TokenValidationResult) => Promise<void>;
+  }
+): Promise<{ candidate: CompanySecretSummary; validation: TokenValidationResult }> {
+  const candidate = await input.createCandidateSecret(
+    input.companyId,
+    createGitHubTokenCandidateSecretName(input.companyId),
+    input.token
+  );
+  await input.bindCandidate(candidate);
+  const validation = await input.validateCandidate({
+    companyId: input.companyId,
+    githubTokenCandidateRef: candidate.id
+  });
+  await input.promoteCandidate(candidate, validation);
+  return { candidate, validation };
+}
+
+/**
+ * Plugin config may predate company-scoped secret references. Never relay raw credentials from
+ * such a row back to the host while patching an unrelated setting. The two supported reference
+ * maps are rebuilt by normalizePluginConfig/mergePluginConfig and remain safe to write.
+ */
+function stripRawCredentialConfigValue(value: unknown, isTopLevel = true): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => stripRawCredentialConfigValue(entry, false));
+  }
+
+  if (!isPlainConfigRecord(value)) {
+    return value;
+  }
+
+  const nextEntries: Array<readonly [string, unknown]> = [];
+  for (const [key, entryValue] of Object.entries(value)) {
+    if (isTopLevel && PLUGIN_CONFIG_SECRET_REF_KEYS.has(key)) {
+      nextEntries.push([key, entryValue] as const);
+      continue;
+    }
+
+    if (shouldStripPluginConfigValue(key, entryValue)) {
+      continue;
+    }
+
+    nextEntries.push([key, stripRawCredentialConfigValue(entryValue, false)] as const);
+  }
+
+  return Object.fromEntries(nextEntries);
+}
+
+function stripRawCredentialConfig(config: GitHubSyncPluginConfig): GitHubSyncPluginConfig {
+  return stripRawCredentialConfigValue(config) as GitHubSyncPluginConfig;
+}
+
 async function writePluginConfig(pluginId: string, companyId: string, config: GitHubSyncPluginConfig): Promise<void> {
   await fetchJson(`/api/plugins/${pluginId}/config`, {
     method: 'POST',
@@ -6943,8 +7023,8 @@ export async function patchPluginConfig(
   }
 
   const rawCurrentConfig = await readRawPluginConfig(pluginId, companyId);
-  const currentConfig = normalizePluginConfig(rawCurrentConfig);
-  const nextConfig = mergePluginConfig(currentConfig, patch);
+  const currentConfig = stripRawCredentialConfig(normalizePluginConfig(rawCurrentConfig));
+  const nextConfig = stripRawCredentialConfig(mergePluginConfig(currentConfig, patch));
   // A legacy row (bare secret-id strings) normalizes to the same bindings the patch produces, so
   // the normalized shapes match even though the stored row still needs upgrading.
   const isLegacySecretRefMigration = hasLegacyPluginSecretRefs(rawCurrentConfig);
@@ -11235,7 +11315,6 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
   const saveRegistration = usePluginAction('settings.saveRegistration');
   const updateBoardAccess = usePluginAction('settings.updateBoardAccess');
   const validateToken = usePluginAction('settings.validateToken');
-  const ensureGitHubTokenAvailable = usePluginAction('settings.ensureGitHubTokenAvailable');
   const runSyncNow = usePluginAction('sync.runNow');
   const cancelSync = usePluginAction('sync.cancel');
   const [form, setForm] = useState<GitHubSyncSettings>(EMPTY_SETTINGS);
@@ -12054,33 +12133,6 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
     event.preventDefault();
     setSubmittingToken(true);
 
-    let validation: TokenValidationResult;
-
-    try {
-      const trimmedToken = tokenDraft.trim();
-      if (!trimmedToken) {
-        throw new Error('Enter a GitHub token.');
-      }
-
-      validation = await validateToken({
-        token: trimmedToken
-      }) as TokenValidationResult;
-    } catch (error) {
-      const message = getActionErrorMessage(error, 'GitHub rejected this token.');
-      if (!hasSavedToken) {
-        setTokenStatusOverride('invalid');
-      }
-      setValidatedLogin(null);
-
-      toast({
-        title: 'GitHub token invalid',
-        body: message,
-        tone: 'error'
-      });
-      setSubmittingToken(false);
-      return;
-    }
-
     try {
       const companyId = hostContext.companyId;
       if (!companyId) {
@@ -12093,33 +12145,37 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       }
 
       const trimmedToken = tokenDraft.trim();
+      if (!trimmedToken) {
+        throw new Error('Enter a GitHub token.');
+      }
 
-      const secretName = `github_sync_${companyId.replace(/[^a-z0-9]+/gi, '_').toLowerCase()}`;
-      const secret = await resolveOrCreateCompanySecret(companyId, secretName, trimmedToken);
-
-      await patchPluginConfig(pluginId, companyId, {
-        githubTokenRefs: {
-          [companyId]: secret.id
+      const { validation } = await stageValidateAndPromoteGitHubTokenCandidate({
+        companyId,
+        token: trimmedToken,
+        createCandidateSecret: createCompanySecretCandidate,
+        bindCandidate: async (candidate) => {
+          await patchPluginConfig(pluginId, companyId, {
+            githubTokenCandidateRefs: {
+              [companyId]: { type: 'secret_ref', secretId: candidate.id }
+            }
+          });
+        },
+        validateCandidate: (candidate) => validateToken(candidate) as Promise<TokenValidationResult>,
+        promoteCandidate: async (candidate, candidateValidation) => {
+          await patchPluginConfig(pluginId, companyId, {
+            githubTokenRefs: {
+              [companyId]: candidate.id
+            }
+          });
+          await saveRegistration({
+            companyId,
+            githubTokenRefs: {
+              [companyId]: candidate.id
+            },
+            githubTokenLogin: candidateValidation.login
+          });
         }
       });
-      await saveRegistration({
-        companyId,
-        githubTokenRefs: {
-          [companyId]: secret.id
-        },
-        githubTokenLogin: validation.login
-      });
-
-      let availabilityWarning: unknown = null;
-      try {
-        await ensureGitHubTokenAvailable({
-          companyId,
-          githubTokenRef: secret.id,
-          token: trimmedToken
-        });
-      } catch (error) {
-        availabilityWarning = error;
-      }
 
       // Opt-in only: Paperclip's own GitHub features read a company secret by name, so mirroring the
       // token there widens its blast radius beyond the plugin worker.
@@ -12150,16 +12206,6 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         body: 'Token saved.',
         tone: 'success'
       });
-      if (availabilityWarning) {
-        toast({
-          title: 'GitHub token saved, but worker token access needs attention',
-          body: getActionErrorMessage(
-            availabilityWarning,
-            'GitHub Sync could not verify worker access to the saved token.'
-          ),
-          tone: 'error'
-        });
-      }
       if (hostSecretExposed) {
         toast({
           title: `Paperclip secret ${HOST_GITHUB_TOKEN_SECRET_NAME} updated`,
@@ -12185,9 +12231,13 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
         return;
       }
     } catch (error) {
+      if (!hasSavedToken) {
+        setTokenStatusOverride('invalid');
+      }
+      setValidatedLogin(null);
       toast({
         title: 'GitHub token could not be saved',
-        body: getActionErrorMessage(error, 'Paperclip could not save the validated token.'),
+        body: getActionErrorMessage(error, 'Paperclip could not save and validate the token.'),
         tone: 'error'
       });
     } finally {
@@ -12243,11 +12293,6 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
       await updateBoardAccess({
         companyId,
         paperclipBoardApiTokenRef: secret.id,
-        paperclipBoardAccess: {
-          authorization: {
-            bearer: boardApiToken
-          }
-        },
         paperclipBoardAccessIdentity: boardIdentity.label ?? '',
         paperclipBoardAccessUserId: boardIdentity.userId ?? ''
       });

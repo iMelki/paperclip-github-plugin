@@ -44,6 +44,14 @@ const TEST_GITHUB_TOKEN = 'ghp_test_token';
 const TEST_GITHUB_SECRET_ID = '00000000-0000-4000-8000-000000000001';
 const TEST_HEAD_COMMIT_SHA = 'c13293efd19eca09004826317182be4e0f502eed';
 
+function testGitHubSecretRefConfig(companyId = 'company-1') {
+  return {
+    githubTokenRefs: {
+      [companyId]: { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+    }
+  };
+}
+
 let plugin!: typeof import('../src/worker.ts').default;
 
 // Paperclip 2026.831 workers must hand the host a `{ type: "secret_ref", secretId }` binding;
@@ -621,7 +629,7 @@ test('trusted direct PR comment evidence preserves normalized PR identity and st
 
 test('PR link metadata refresh cannot overwrite a concurrent explicit owner update', async () => {
   const workerModule = await importFreshWorkerModule();
-  const harness = createTestHarness({ manifest, config: { githubToken: TEST_GITHUB_TOKEN } });
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
   const base = {
     companyId: 'company-1',
     projectId: 'project-1',
@@ -687,7 +695,7 @@ test('PR link metadata refresh cannot overwrite a concurrent explicit owner upda
 
 test('PR link metadata refresh reuses case-insensitive repository identity', async () => {
   const workerModule = await importFreshWorkerModule();
-  const harness = createTestHarness({ manifest, config: { githubToken: TEST_GITHUB_TOKEN } });
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
   const base = {
     companyId: 'company-1',
     projectId: 'project-1',
@@ -733,7 +741,7 @@ test('PR link metadata refresh reuses case-insensitive repository identity', asy
 
 test('PR link metadata refresh uses the exact external id before scanning issue links', async () => {
   const workerModule = await importFreshWorkerModule();
-  const harness = createTestHarness({ manifest, config: { githubToken: TEST_GITHUB_TOKEN } });
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
   const params = {
     companyId: 'company-1',
     projectId: 'project-1',
@@ -997,10 +1005,9 @@ test('GitHub request failures are logged through the plugin logger instead of st
 
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: TEST_GITHUB_TOKEN
-    }
+    config: testGitHubSecretRefConfig()
   });
+  harness.ctx.secrets.resolve = async () => TEST_GITHUB_TOKEN;
   const warnings: Array<{ message: string; metadata: Record<string, unknown> }> = [];
   const stderrCalls: unknown[][] = [];
   const originalFetch = globalThis.fetch;
@@ -1305,10 +1312,9 @@ async function createGitHubAgentToolHarness(options: {
   const workspacePath = options.workspacePath ?? '/tmp/paperclip-github-plugin-example-repo/.paperclip/worktrees/issue-worktree';
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: TEST_GITHUB_TOKEN
-    }
+    config: testGitHubSecretRefConfig()
   });
+  harness.ctx.secrets.resolve = async () => TEST_GITHUB_TOKEN;
   const project = createProjectFixture({
     id: 'project-1',
     companyId: 'company-1',
@@ -1358,10 +1364,9 @@ async function createGitHubAgentToolHarness(options: {
 async function createProjectPullRequestsHarness() {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: TEST_GITHUB_TOKEN
-    }
+    config: testGitHubSecretRefConfig()
   });
+  harness.ctx.secrets.resolve = async () => TEST_GITHUB_TOKEN;
   await plugin.definition.setup(harness.ctx);
   await harness.performAction('settings.saveRegistration', {
     mappings: [
@@ -3517,9 +3522,7 @@ test('company metric API route resolves a gh-created pull request repository fro
 test('link_github_item agent tool links third-party pull requests to Paperclip issues', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: TEST_GITHUB_TOKEN
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
   harness.ctx.agents.get = async (agentId, companyId) => {
@@ -3667,7 +3670,7 @@ test('link_github_item agent tool links third-party pull requests to Paperclip i
 });
 
 test('link_github_item rejects missing and cross-company follow-through owners before linking', async () => {
-  const harness = createTestHarness({ manifest, config: { githubToken: TEST_GITHUB_TOKEN } });
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
   await plugin.definition.setup(harness.ctx);
   const issue = await harness.ctx.issues.create({
     companyId: 'company-1', projectId: 'project-1', title: 'Owner validation', description: ''
@@ -3710,7 +3713,7 @@ test('link_github_item rejects missing and cross-company follow-through owners b
 });
 
 test('tracked agent tools return structured errors when intent persistence fails', async () => {
-  const harness = createTestHarness({ manifest, config: { githubToken: TEST_GITHUB_TOKEN } });
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
   await plugin.definition.setup(harness.ctx);
   const issue = await harness.ctx.issues.create({
     companyId: 'company-1', projectId: 'project-1', title: 'Intent failure', description: ''
@@ -3733,7 +3736,7 @@ test('tracked agent tools return structured errors when intent persistence fails
 });
 
 test('tracked agent tools return structured errors when result persistence fails after mutation', async () => {
-  const harness = createTestHarness({ manifest, config: { githubToken: TEST_GITHUB_TOKEN } });
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
   await plugin.definition.setup(harness.ctx);
   const originalFetch = globalThis.fetch;
   const issue = await harness.ctx.issues.create({
@@ -3776,7 +3779,7 @@ test('tracked agent tools return structured errors when result persistence fails
 });
 
 test('tracked agent tools surface both mutation and result persistence failures', async () => {
-  const harness = createTestHarness({ manifest, config: { githubToken: TEST_GITHUB_TOKEN } });
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
   await plugin.definition.setup(harness.ctx);
   const issue = await harness.ctx.issues.create({
     companyId: 'company-1', projectId: 'project-1', title: 'Dual failure', description: ''
@@ -6356,7 +6359,7 @@ test('mergePluginConfig preserves existing config while merging token and board 
   assert.equal(result.customFlag, true);
 });
 
-test('patchPluginConfig retries without plugin secret refs when the host rejects secret refs', async () => {
+test('patchPluginConfig does not relay legacy raw credentials when the host rejects secret refs', async () => {
   const uiModule = await importFreshUiModule() as {
     patchPluginConfig?: unknown;
   };
@@ -6436,23 +6439,8 @@ test('patchPluginConfig retries without plugin secret refs when the host rejects
           githubTokenRefs: {
             'company-1': { type: 'secret_ref', secretId: 'github-secret-ref' }
           },
-          githubTokenRef: 'legacy-github-secret-ref',
-          githubTokensByCompanyId: {
-            'company-1': 'ghp_raw_github_token'
-          },
           paperclipBoardApiTokenRefs: {
             'company-1': { type: 'secret_ref', secretId: 'board-secret-ref' }
-          },
-          paperclipBoardApiTokenRef: 'legacy-board-secret-ref',
-          paperclipBoardApiTokensByCompanyId: {
-            'company-1': 'raw-paperclip-board-token'
-          },
-          legacyNestedSecret: {
-            type: 'secret_ref',
-            secretId: '00000000-0000-4000-8000-000000000099'
-          },
-          nestedRawToken: {
-            token: 'raw-nested-token'
           },
           customFlag: true,
           paperclipApiBaseUrl: 'http://localhost:3100'
@@ -7911,10 +7899,9 @@ test('project.pullRequests.page returns token capability audit for action visibi
 test('project.pullRequests.page reuses cached metrics filter indexes and only fetches the visible filtered rows', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig('company-cache-test')
   });
+  harness.ctx.secrets.resolve = async () => TEST_GITHUB_TOKEN;
   await plugin.definition.setup(harness.ctx);
   await harness.performAction('settings.saveRegistration', {
     mappings: [
@@ -8345,10 +8332,9 @@ test('settings.tokenPermissionAudit reports missing repository permissions for m
 test('project.pullRequests.detail returns the GitHub conversation in timeline order', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig('company-detail')
   });
+  harness.ctx.secrets.resolve = async () => TEST_GITHUB_TOKEN;
   await plugin.definition.setup(harness.ctx);
   await harness.performAction('settings.saveRegistration', {
     mappings: [
@@ -12152,9 +12138,7 @@ test('project.pullRequests.count returns a lightweight open pull request total f
 test('project.pullRequests.count recovers mappings missing a saved company id when the project id matches', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
 
@@ -12214,9 +12198,7 @@ test('project.pullRequests.count recovers mappings missing a saved company id wh
 test('project.pullRequests.count recovers mappings missing a saved project id by matching the current project name', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
   harness.seed({
@@ -12284,9 +12266,7 @@ test('project.pullRequests.count recovers mappings missing a saved project id by
 test('project.pullRequests.count falls back to the project repository binding when no saved mapping exists', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
   harness.seed({
@@ -15483,7 +15463,7 @@ test('settings.saveRegistration persists the saved GitHub login label for later 
   assert.equal(registrationResult.githubTokenLogin, 'octocat');
 });
 
-test('settings.registration reports a configured token from the external config file without resolving secrets', { concurrency: false }, async () => {
+test('settings.registration ignores a worker-local raw token file', { concurrency: false }, async () => {
   await withExternalPluginConfig(
     {
       githubToken: 'ghp_external_token'
@@ -15503,14 +15483,14 @@ test('settings.registration reports a configured token from the external config 
         syncState?: { status?: string };
       }>('settings.registration');
 
-      assert.equal(result.githubTokenConfigured, true);
+      assert.equal(result.githubTokenConfigured, false);
       assert.equal(result.syncState?.status, 'idle');
       assert.equal(resolveCount, 0);
     }
   );
 });
 
-test('settings.registration reports a configured token from the external config file inside PAPERCLIP_HOME', { concurrency: false }, async () => {
+test('settings.registration ignores a worker-local raw token file inside PAPERCLIP_HOME', { concurrency: false }, async () => {
   await withExternalPluginConfig(
     {
       githubToken: 'ghp_external_token'
@@ -15530,7 +15510,7 @@ test('settings.registration reports a configured token from the external config 
         syncState?: { status?: string };
       }>('settings.registration');
 
-      assert.equal(result.githubTokenConfigured, true);
+      assert.equal(result.githubTokenConfigured, false);
       assert.equal(result.syncState?.status, 'idle');
       assert.equal(resolveCount, 0);
     },
@@ -15538,96 +15518,174 @@ test('settings.registration reports a configured token from the external config 
   );
 });
 
-test('settings.ensureGitHubTokenAvailable writes a company-scoped fallback when plugin secret refs are disabled', { concurrency: false }, async () => {
+test('legacy raw-token actions are rejected without creating a worker-local token file', { concurrency: false }, async () => {
   await withTemporaryPaperclipHome(async ({ configFilePath }) => {
-    const harness = createTestHarness({
-      manifest,
-      config: {
-        githubTokenRefs: {
-          'company-1': TEST_GITHUB_SECRET_ID
-        }
-      }
-    });
+    const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
 
-    harness.ctx.secrets.resolve = async () => {
-      throw new Error('Plugin secret references are disabled until company-scoped plugin config lands');
-    };
+    await assert.rejects(
+      harness.performAction('settings.saveRegistration', {
+        companyId: 'company-1',
+        githubTokenRef: 'ghp_company_fallback_token'
+      }),
+      /Raw credential action payloads are not accepted/
+    );
+    await assert.rejects(
+      harness.performAction('settings.saveRegistration', {
+        companyId: 'company-1',
+        githubTokenRefs: { 'company-1': 'github_pat_company_fallback_token' }
+      }),
+      /Raw credential action payloads are not accepted/
+    );
+    await assert.rejects(
+      harness.performAction('settings.updateBoardAccess', {
+        companyId: 'company-1',
+        paperclipBoardApiTokenRef: 'paperclip-board-token'
+      }),
+      /Raw credential action payloads are not accepted/
+    );
 
-    const result = await harness.performAction('settings.ensureGitHubTokenAvailable', {
-      companyId: 'company-1',
-      githubTokenRef: TEST_GITHUB_SECRET_ID,
-      token: 'ghp_company_fallback_token'
-    }) as {
-      secretResolvable?: boolean;
-      fallbackStored?: boolean;
-    };
-
-    assert.deepEqual(result, {
-      secretResolvable: false,
-      fallbackStored: true
-    });
-
-    const storedConfig = JSON.parse(await readFile(configFilePath, 'utf8')) as {
-      githubTokensByCompanyId?: Record<string, string>;
-    };
-
-    assert.deepEqual(storedConfig.githubTokensByCompanyId, {
-      'company-1': 'ghp_company_fallback_token'
-    });
+    await assert.rejects(
+      harness.performAction('settings.ensureGitHubTokenAvailable', {
+        companyId: 'company-1',
+        githubTokenRef: TEST_GITHUB_SECRET_ID,
+        token: 'ghp_company_fallback_token'
+      }),
+      /Raw credential action payloads are not accepted/
+    );
+    await assert.rejects(
+      harness.performAction('settings.validateToken', {
+        companyId: 'company-1',
+        githubTokenRef: TEST_GITHUB_SECRET_ID,
+        token: 'ghp_company_fallback_token'
+      }),
+      /Raw credential action payloads are not accepted/
+    );
+    await assert.rejects(readFile(configFilePath, 'utf8'), { code: 'ENOENT' });
+    assert.equal(harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }), undefined);
+    assert.equal(JSON.stringify(harness.logs).includes('ghp_company_fallback_token'), false);
+    assert.equal(JSON.stringify(harness.logs).includes('paperclip-board-token'), false);
   });
 });
 
-test('settings.ensureGitHubTokenAvailable overwrites invalid worker-local config with the company fallback token', { concurrency: false }, async () => {
+test('staged GitHub token validation does not replace an existing working binding when a candidate is denied', async () => {
+  const uiModule = await importFreshUiModule() as {
+    stageValidateAndPromoteGitHubTokenCandidate?: (input: {
+      companyId: string;
+      token: string;
+      createCandidateSecret: (companyId: string, name: string, token: string) => Promise<{ id: string; name: string }>;
+      bindCandidate: (candidate: { id: string; name: string }) => Promise<void>;
+      validateCandidate: (input: { companyId: string; githubTokenCandidateRef: string }) => Promise<{ login: string }>;
+      promoteCandidate: (candidate: { id: string; name: string }, validation: { login: string }) => Promise<void>;
+    }) => Promise<unknown>;
+  };
+
+  assert.equal(typeof uiModule.stageValidateAndPromoteGitHubTokenCandidate, 'function');
+  let activeBinding = 'working-secret-ref';
+  let candidateName = '';
+  let candidateBinding = '';
+  let promotionCount = 0;
+
+  const stageValidateAndPromoteGitHubTokenCandidate = uiModule.stageValidateAndPromoteGitHubTokenCandidate as NonNullable<
+    typeof uiModule.stageValidateAndPromoteGitHubTokenCandidate
+  >;
+  await assert.rejects(
+    stageValidateAndPromoteGitHubTokenCandidate({
+      companyId: 'company-1',
+      token: 'ghp_invalid_candidate_token',
+      createCandidateSecret: async (_companyId, name) => {
+        candidateName = name;
+        return { id: 'candidate-secret-ref', name };
+      },
+      bindCandidate: async (candidate) => {
+        candidateBinding = candidate.id;
+      },
+      validateCandidate: async () => {
+        throw new Error('GitHub denied the candidate token.');
+      },
+      promoteCandidate: async (candidate) => {
+        promotionCount += 1;
+        activeBinding = candidate.id;
+      }
+    }),
+    /GitHub denied the candidate token/
+  );
+
+  assert.match(candidateName, /^github_sync_company_1_candidate_/);
+  assert.equal(candidateBinding, 'candidate-secret-ref');
+  assert.equal(activeBinding, 'working-secret-ref');
+  assert.equal(promotionCount, 0);
+});
+
+test('staged GitHub token validation binds a candidate before resolving it and promotes only after success', async () => {
+  const uiModule = await importFreshUiModule() as {
+    stageValidateAndPromoteGitHubTokenCandidate?: (input: {
+      companyId: string;
+      token: string;
+      createCandidateSecret: (companyId: string, name: string, token: string) => Promise<{ id: string; name: string }>;
+      bindCandidate: (candidate: { id: string; name: string }) => Promise<void>;
+      validateCandidate: (input: { companyId: string; githubTokenCandidateRef: string }) => Promise<{ login: string }>;
+      promoteCandidate: (candidate: { id: string; name: string }, validation: { login: string }) => Promise<void>;
+    }) => Promise<unknown>;
+  };
+  const stage = uiModule.stageValidateAndPromoteGitHubTokenCandidate as NonNullable<
+    typeof uiModule.stageValidateAndPromoteGitHubTokenCandidate
+  >;
+  let activeBinding = 'working-secret-ref';
+  const operations: string[] = [];
+
+  await stage({
+    companyId: 'company-1',
+    token: 'ghp_valid_candidate_token',
+    createCandidateSecret: async () => {
+      operations.push('create');
+      return { id: 'candidate-secret-ref', name: 'candidate' };
+    },
+    bindCandidate: async (candidate) => {
+      operations.push(`bind:${candidate.id}`);
+    },
+    validateCandidate: async (candidate) => {
+      operations.push(`validate:${candidate.githubTokenCandidateRef}`);
+      return { login: 'octocat' };
+    },
+    promoteCandidate: async (candidate) => {
+      operations.push(`promote:${candidate.id}`);
+      activeBinding = candidate.id;
+    }
+  });
+
+  assert.deepEqual(operations, [
+    'create',
+    'bind:candidate-secret-ref',
+    'validate:candidate-secret-ref',
+    'promote:candidate-secret-ref'
+  ]);
+  assert.equal(activeBinding, 'candidate-secret-ref');
+});
+
+test('board-access actions reject raw token fields without reading or writing a worker-local token file', { concurrency: false }, async () => {
   await withTemporaryPaperclipHome(async ({ configFilePath }) => {
     await mkdir(dirname(configFilePath), { recursive: true });
-    await writeFile(configFilePath, '{not valid json', 'utf8');
+    await writeFile(configFilePath, '{"unrelated":"value"}', 'utf8');
 
-    const harness = createTestHarness({
-      manifest,
-      config: {
-        githubTokenRefs: {
-          'company-1': TEST_GITHUB_SECRET_ID
-        }
-      }
-    });
+    const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
 
-    harness.ctx.secrets.resolve = async () => {
-      throw new Error('Plugin secret references are disabled until company-scoped plugin config lands');
-    };
-
-    const result = await harness.performAction('settings.ensureGitHubTokenAvailable', {
+    await assert.rejects(harness.performAction('settings.updateBoardAccess', {
       companyId: 'company-1',
-      githubTokenRef: TEST_GITHUB_SECRET_ID,
-      token: 'ghp_company_fallback_token'
-    }) as {
-      secretResolvable?: boolean;
-      fallbackStored?: boolean;
-    };
+      paperclipBoardApiTokenRef: 'board-secret-ref',
+      paperclipBoardAccess: { authorization: { bearer: 'paperclip-board-token' } }
+    }), /Raw credential action payloads are not accepted/);
 
-    assert.deepEqual(result, {
-      secretResolvable: false,
-      fallbackStored: true
-    });
-
-    const storedConfig = JSON.parse(await readFile(configFilePath, 'utf8')) as {
-      githubTokensByCompanyId?: Record<string, string>;
-    };
-
-    assert.deepEqual(storedConfig.githubTokensByCompanyId, {
-      'company-1': 'ghp_company_fallback_token'
-    });
-    assert.ok(
-      harness.logs.some((entry) =>
-        entry.level === 'warn'
-        && entry.message.includes('worker-local token fallback config file because it is not valid JSON')
-      )
-    );
+    assert.equal(await readFile(configFilePath, 'utf8'), '{"unrelated":"value"}');
+    assert.equal(JSON.stringify(harness.logs).includes('paperclip-board-token'), false);
   });
 });
 
-test('settings.updateBoardAccess keeps a board token fallback until the secret ref is mirrored into plugin config', { concurrency: false }, async () => {
+test('settings.updateBoardAccess persists only the board secret ref and does not modify a legacy token file', { concurrency: false }, async () => {
   await withTemporaryPaperclipHome(async ({ configFilePath }) => {
     const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
@@ -15642,35 +15700,21 @@ test('settings.updateBoardAccess keeps a board token fallback until the secret r
       'utf8'
     );
 
-    let resolveCount = 0;
-    harness.ctx.secrets.resolve = async (secretRef) => {
-      resolveCount += 1;
-      assert.equal(secretRefId(secretRef), 'board-secret-ref');
-      return 'paperclip-board-token';
-    };
-
     await harness.performAction('settings.updateBoardAccess', {
       companyId: 'company-1',
       paperclipBoardApiTokenRef: 'board-secret-ref',
-      paperclipBoardAccess: {
-        authorization: {
-          bearer: 'paperclip-board-token'
-        }
-      },
       paperclipBoardAccessIdentity: 'Jane Operator'
     });
 
-    const storedConfig = JSON.parse(await readFile(configFilePath, 'utf8')) as {
-      paperclipBoardApiTokensByCompanyId?: Record<string, string>;
-    };
-    assert.deepEqual(storedConfig.paperclipBoardApiTokensByCompanyId, {
-      'company-1': 'paperclip-board-token'
+    assert.deepEqual(JSON.parse(await readFile(configFilePath, 'utf8')), {
+      paperclipBoardApiTokenRefs: {
+        'company-1': 'board-secret-ref'
+      }
     });
-    assert.equal(resolveCount, 0);
   });
 });
 
-test('settings.updateBoardAccess skips the board token fallback after the secret ref is mirrored into plugin config', { concurrency: false }, async () => {
+test('settings.updateBoardAccess does not create a worker-local token file for a bound secret ref', { concurrency: false }, async () => {
   await withTemporaryPaperclipHome(async ({ configFilePath }) => {
     const harness = createTestHarness({
       manifest,
@@ -15682,55 +15726,74 @@ test('settings.updateBoardAccess skips the board token fallback after the secret
     });
     await plugin.definition.setup(harness.ctx);
 
-    let resolveCount = 0;
-    harness.ctx.secrets.resolve = async (secretRef) => {
-      resolveCount += 1;
-      assert.equal(secretRefId(secretRef), 'board-secret-ref');
-      return 'paperclip-board-token';
-    };
-
     await harness.performAction('settings.updateBoardAccess', {
       companyId: 'company-1',
       paperclipBoardApiTokenRef: 'board-secret-ref',
-      paperclipBoardApiToken: 'paperclip-board-token',
       paperclipBoardAccessIdentity: 'Jane Operator'
     });
 
     await assert.rejects(readFile(configFilePath, 'utf8'), {
       code: 'ENOENT'
     });
-    assert.equal(resolveCount, 1);
   });
 });
 
-test('settings.updateBoardAccess writes a company-scoped board token fallback when secret refs are disabled', { concurrency: false }, async () => {
+test('sync fails closed before GitHub access when the configured board secret cannot be resolved', async () => {
   await withTemporaryPaperclipHome(async ({ configFilePath }) => {
-    const harness = createTestHarness({ manifest });
+    const harness = createTestHarness({
+      manifest,
+      config: {
+        githubTokenRefs: {
+          'company-1': { type: 'secret_ref', secretId: 'github-secret-ref' }
+        },
+        paperclipBoardApiTokenRefs: {
+          'company-1': { type: 'secret_ref', secretId: 'board-secret-ref' }
+        }
+      }
+    });
     await plugin.definition.setup(harness.ctx);
 
     harness.ctx.secrets.resolve = async (secretRef) => {
-      assert.equal(secretRefId(secretRef), 'board-secret-ref');
-      throw new Error('Plugin secret references are disabled until company-scoped plugin config lands');
+      if (secretRefId(secretRef) === 'github-secret-ref') {
+        return 'github-token';
+      }
+      throw new Error('Secret is not bound to plugin');
     };
-
-    await harness.performAction('settings.updateBoardAccess', {
+    await harness.performAction('settings.saveRegistration', {
       companyId: 'company-1',
-      paperclipBoardApiTokenRef: 'board-secret-ref',
-      paperclipBoardApiToken: 'paperclip-board-token',
-      paperclipBoardAccessIdentity: 'Jane Operator'
+      mappings: [{
+        id: 'mapping-1',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }]
     });
 
-    const storedConfig = JSON.parse(await readFile(configFilePath, 'utf8')) as {
-      paperclipBoardApiTokensByCompanyId?: Record<string, string>;
+    const originalFetch = globalThis.fetch;
+    const requests: string[] = [];
+    globalThis.fetch = async (input) => {
+      requests.push(getRequestUrl(input));
+      throw new Error(`Unexpected outbound request: ${getRequestUrl(input)}`);
     };
 
-    assert.deepEqual(storedConfig.paperclipBoardApiTokensByCompanyId, {
-      'company-1': 'paperclip-board-token'
-    });
+    try {
+      const result = await harness.performAction('sync.runNow', {
+        companyId: 'company-1',
+        waitForCompletion: true
+      }) as { syncState: { status: string; message?: string } };
+
+      assert.equal(result.syncState.status, 'error');
+      assert.match(result.syncState.message ?? '', /Unable to resolve the configured Paperclip board access secret/);
+      assert.deepEqual(requests, []);
+      await assert.rejects(readFile(configFilePath, 'utf8'), { code: 'ENOENT' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
-test('settings.updateBoardAccess tightens worker-local config permissions when clearing board token fallbacks', { concurrency: false }, async () => {
+test('settings.updateBoardAccess leaves legacy worker-local token files untouched', { concurrency: false }, async () => {
   await withTemporaryPaperclipHome(async ({ configFilePath }) => {
     const harness = createTestHarness({ manifest });
     await plugin.definition.setup(harness.ctx);
@@ -15758,12 +15821,14 @@ test('settings.updateBoardAccess tightens worker-local config permissions when c
       paperclipBoardApiTokensByCompanyId?: Record<string, string>;
     };
 
-    assert.equal(storedConfig.paperclipBoardApiTokensByCompanyId, undefined);
-    assert.equal((await stat(configFilePath)).mode & 0o777, 0o600);
+    assert.deepEqual(storedConfig.paperclipBoardApiTokensByCompanyId, {
+      'company-1': 'paperclip-board-token'
+    });
+    assert.equal((await stat(configFilePath)).mode & 0o777, 0o666);
   });
 });
 
-test('resolvePaperclipApiAuthTokens falls back to the worker-local board token when plugin secret refs are disabled', async () => {
+test('resolvePaperclipApiAuthTokens rejects a configured board secret that cannot be resolved', async () => {
   const workerModule = await importFreshWorkerModule();
   const testing = workerModule.__testing as typeof workerModule.__testing & {
     resolvePaperclipApiAuthTokens?: (
@@ -15778,11 +15843,7 @@ test('resolvePaperclipApiAuthTokens falls back to the worker-local board token w
 
   const harness = createTestHarness({
     manifest,
-    config: {
-      paperclipBoardApiTokensByCompanyId: {
-        'company-1': 'paperclip-board-token'
-      }
-    }
+    config: {}
   });
   await plugin.definition.setup(harness.ctx);
 
@@ -15792,33 +15853,27 @@ test('resolvePaperclipApiAuthTokens falls back to the worker-local board token w
     throw new Error('Plugin secret references are disabled until company-scoped plugin config lands');
   };
 
-  const tokens = await testing.resolvePaperclipApiAuthTokens(
-    harness.ctx,
-    {
-      paperclipBoardApiTokenRefs: {
-        'company-1': 'board-secret-ref'
-      }
-    },
-    {
-      paperclipBoardApiTokenRefs: {
-        'company-1': 'board-secret-ref'
-      },
-      paperclipBoardApiTokensByCompanyId: {
-        'company-1': 'paperclip-board-token'
-      }
-    },
-    [
+  await assert.rejects(
+    testing.resolvePaperclipApiAuthTokens(
+      harness.ctx,
       {
-        companyId: 'company-1'
-      }
-    ]
+        paperclipBoardApiTokenRefs: {
+          'company-1': 'board-secret-ref'
+        }
+      },
+      {
+        paperclipBoardApiTokenRefs: {
+          'company-1': 'board-secret-ref'
+        }
+      },
+      [{ companyId: 'company-1' }]
+    ),
+    /Unable to resolve the configured Paperclip board access secret/
   );
-
   assert.equal(resolveCount, 1);
-  assert.equal(tokens.get('company-1'), 'paperclip-board-token');
 });
 
-test('sync.runNow falls back to a company-scoped external config token when plugin secret refs are disabled', { concurrency: false }, async () => {
+test('sync.runNow ignores a company-scoped external raw token and fails closed when secret resolution fails', { concurrency: false }, async () => {
   await withExternalPluginConfig(
     {
       githubTokensByCompanyId: {
@@ -15850,7 +15905,7 @@ test('sync.runNow falls back to a company-scoped external config token when plug
 
       assert.equal(resolveCount, 1);
       assert.equal(result.syncState.status, 'error');
-      assert.equal(result.syncState.message, 'Save at least one mapping with a created Paperclip project before running sync.');
+      assert.match(result.syncState.message ?? '', /Unable to resolve the configured GitHub token secret/);
       assert.equal(result.syncState.lastRunTrigger, 'manual');
     }
   );
@@ -16262,9 +16317,21 @@ test('worker rejects untrusted Paperclip API origins when saving setup', async (
   );
 });
 
-test('worker validates a GitHub token by reaching the GitHub API', async () => {
-  const harness = createTestHarness({ manifest });
+test('worker validates a company-scoped GitHub token secret by reaching the GitHub API', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-1': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
   await plugin.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async (secretRef, options) => {
+    assert.equal(secretRefId(secretRef), TEST_GITHUB_SECRET_ID);
+    assert.deepEqual(options, { companyId: 'company-1', configPath: 'githubTokenRefs.company-1' });
+    return 'ghp_test_token';
+  };
 
   const originalFetch = globalThis.fetch;
 
@@ -16288,7 +16355,8 @@ test('worker validates a GitHub token by reaching the GitHub API', async () => {
 
   try {
     const result = await harness.performAction('settings.validateToken', {
-      token: 'ghp_test_token'
+      companyId: 'company-1',
+      githubTokenRef: TEST_GITHUB_SECRET_ID
     });
 
     assert.deepEqual(result, {
@@ -16299,9 +16367,17 @@ test('worker validates a GitHub token by reaching the GitHub API', async () => {
   }
 });
 
-test('worker keeps expected GitHub token validation failures out of warning logs', async () => {
-  const harness = createTestHarness({ manifest });
+test('worker keeps expected secret-backed GitHub token validation failures out of warning logs', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-1': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
   await plugin.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'ghp_rejected_token';
 
   const warnings: Array<{ message: string; data: unknown }> = [];
   harness.ctx.logger.warn = (message, data) => {
@@ -16324,12 +16400,198 @@ test('worker keeps expected GitHub token validation failures out of warning logs
   try {
     await assert.rejects(
       harness.performAction('settings.validateToken', {
-        token: 'ghp_rejected_token'
+        companyId: 'company-1',
+        githubTokenRef: TEST_GITHUB_SECRET_ID
       }),
       /GitHub rejected this token/
     );
 
     assert.deepEqual(warnings, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('settings.validateToken resolves a separately bound company-scoped candidate before promotion', async () => {
+  const candidateSecretId = '00000000-0000-4000-8000-000000000002';
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-1': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      },
+      githubTokenCandidateRefs: {
+        'company-1': { type: 'secret_ref', secretId: candidateSecretId }
+      }
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async (secretRef, options) => {
+    assert.equal(secretRefId(secretRef), candidateSecretId);
+    assert.deepEqual(options, {
+      companyId: 'company-1',
+      configPath: 'githubTokenCandidateRefs.company-1'
+    });
+    return 'ghp_valid_candidate_token';
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    assert.equal(getRequestUrl(input), 'https://api.github.com/user');
+    return jsonResponse({ login: 'octocat' });
+  };
+
+  try {
+    const result = await harness.performAction('settings.validateToken', {
+      companyId: 'company-1',
+      githubTokenCandidateRef: candidateSecretId
+    });
+    assert.deepEqual(result, { login: 'octocat' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('settings.validateToken denies a candidate ref at the wrong company-scoped binding path', async () => {
+  const candidateSecretId = '00000000-0000-4000-8000-000000000002';
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenCandidateRefs: {
+        'company-1': { type: 'secret_ref', secretId: candidateSecretId }
+      }
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  let resolveOptions: unknown;
+  harness.ctx.secrets.resolve = async (_secretRef, options) => {
+    resolveOptions = options;
+    throw new Error('binding_missing for company-2');
+  };
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(getRequestUrl(input));
+    throw new Error('GitHub must not be called for an unbound candidate.');
+  };
+
+  try {
+    await assert.rejects(
+      harness.performAction('settings.validateToken', {
+        companyId: 'company-2',
+        githubTokenCandidateRef: candidateSecretId
+      }),
+      /Unable to resolve the configured GitHub token secret/
+    );
+    assert.deepEqual(resolveOptions, {
+      companyId: 'company-2',
+      configPath: 'githubTokenCandidateRefs.company-2'
+    });
+    assert.deepEqual(requests, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('settings.registration degrades board diagnostics for an unbound saved board secret without outbound requests', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      paperclipApiBaseUrl: 'http://127.0.0.1:3100'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  await harness.performAction('settings.updateBoardAccess', {
+    companyId: 'company-1',
+    paperclipBoardApiTokenRef: 'board-secret-ref'
+  });
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(getRequestUrl(input));
+    throw new Error('Protected board request must not be sent.');
+  };
+
+  try {
+    const result = await harness.getData<{
+      agentToolAccess?: { status?: string; needsBoardAccessRepair?: boolean };
+      paperclipBoardAccessNeedsConfigSync?: boolean;
+    }>('settings.registration', { companyId: 'company-1' });
+
+    assert.equal(result.agentToolAccess?.status, 'unavailable');
+    assert.equal(result.agentToolAccess?.needsBoardAccessRepair, true);
+    assert.equal(result.paperclipBoardAccessNeedsConfigSync, true);
+    assert.deepEqual(requests, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('settings.registration degrades board diagnostics for a revoked board secret without outbound requests', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      paperclipApiBaseUrl: 'http://127.0.0.1:3100',
+      paperclipBoardApiTokenRefs: {
+        'company-1': { type: 'secret_ref', secretId: 'board-secret-ref' }
+      }
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => {
+    throw new Error('provider denied board-secret-ref');
+  };
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(getRequestUrl(input));
+    throw new Error('Protected board request must not be sent.');
+  };
+
+  try {
+    const result = await harness.getData<{
+      agentToolAccess?: { status?: string; needsBoardAccessRepair?: boolean };
+    }>('settings.registration', { companyId: 'company-1' });
+
+    assert.equal(result.agentToolAccess?.status, 'unavailable');
+    assert.equal(result.agentToolAccess?.needsBoardAccessRepair, true);
+    assert.equal(JSON.stringify(harness.logs).includes('provider denied board-secret-ref'), false);
+    assert.deepEqual(requests, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('settings.validateToken redacts secret-resolution failures and makes no GitHub request', async () => {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-1': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  const sentinel = 'provider denied secret: ghp_should_not_leak';
+  harness.ctx.secrets.resolve = async () => {
+    throw new Error(sentinel);
+  };
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  globalThis.fetch = async (input) => {
+    requests.push(getRequestUrl(input));
+    throw new Error('GitHub must not be called when secret resolution fails.');
+  };
+
+  try {
+    await assert.rejects(
+      harness.performAction('settings.validateToken', {
+        companyId: 'company-1',
+        githubTokenRef: TEST_GITHUB_SECRET_ID
+      }),
+      /Unable to resolve the configured GitHub token secret/
+    );
+    assert.equal(JSON.stringify(harness.logs).includes(sentinel), false);
+    assert.deepEqual(requests, []);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -24996,9 +25258,7 @@ test('worker preserves blocked maintainer-approval waits for linked pull request
 test('worker handles linked pull requests from other repositories', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
 
@@ -28427,7 +28687,7 @@ test('sync.runNow falls back to the saved githubTokenRef when config has not pro
   assert.equal(result.syncState.lastRunTrigger, 'manual');
 });
 
-test('sync.runNow falls back to the external config file token when no secret ref is configured', { concurrency: false }, async () => {
+test('sync.runNow ignores the external raw token file when no secret ref is configured', { concurrency: false }, async () => {
   await withExternalPluginConfig(
     {
       githubToken: 'ghp_external_token'
@@ -28448,7 +28708,7 @@ test('sync.runNow falls back to the external config file token when no secret re
 
       assert.equal(resolveCount, 0);
       assert.equal(result.syncState.status, 'error');
-      assert.equal(result.syncState.message, 'Save at least one mapping with a created Paperclip project before running sync.');
+      assert.equal(result.syncState.message, 'Configure a GitHub token before running sync.');
       assert.equal(result.syncState.lastRunTrigger, 'manual');
     }
   );
@@ -28686,7 +28946,7 @@ test('settings registration clears legacy setup errors once the missing token is
         errorDetails: {
           phase: 'configuration',
           suggestedAction:
-            'Open settings and save a GitHub token secret, or create $PAPERCLIP_HOME/plugins/github-sync/config.json (or ~/.paperclip/plugins/github-sync/config.json when PAPERCLIP_HOME is unset) with a "githubToken" value, and then run sync again.'
+            'Open settings and save a GitHub token secret, then run sync again.'
         }
       },
       scheduleFrequencyMinutes: 15
@@ -28827,7 +29087,7 @@ test('saving setup clears stale setup errors instead of resaving them from the U
         errorDetails: {
           phase: 'configuration',
           suggestedAction:
-            'Open settings and save a GitHub token secret, or create $PAPERCLIP_HOME/plugins/github-sync/config.json (or ~/.paperclip/plugins/github-sync/config.json when PAPERCLIP_HOME is unset) with a "githubToken" value, and then run sync again.'
+            'Open settings and save a GitHub token secret, then run sync again.'
         }
       },
       scheduleFrequencyMinutes: 15
@@ -28852,7 +29112,7 @@ test('saving setup clears stale setup errors instead of resaving them from the U
       errorDetails: {
         phase: 'configuration',
         suggestedAction:
-          'Open settings and save a GitHub token secret, or create $PAPERCLIP_HOME/plugins/github-sync/config.json (or ~/.paperclip/plugins/github-sync/config.json when PAPERCLIP_HOME is unset) with a "githubToken" value, and then run sync again.'
+          'Open settings and save a GitHub token secret, then run sync again.'
       }
     }
   }) as {
@@ -29820,9 +30080,7 @@ test('repeat sync.runNow keeps a live company-scoped sync in running state', asy
 test('company-scoped sync.runNow persists the completed scoped sync state', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
 
@@ -30111,9 +30369,7 @@ test('worker can cancel a long-running manual sync after it has started', async 
 test('sync.runNow clears the cancellation marker with state.delete instead of writing null state', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
 
@@ -30426,9 +30682,7 @@ test('sync.cancel finalizes the only company-scoped orphaned running sync after 
 test('scheduled job does not restart an orphaned running sync', async () => {
   const harness = createTestHarness({
     manifest,
-    config: {
-      githubToken: 'ghp_test_token'
-    }
+    config: testGitHubSecretRefConfig()
   });
   await plugin.definition.setup(harness.ctx);
 
@@ -31138,14 +31392,7 @@ test('scheduled sync records the scope-denied operator message for a company the
     'Paperclip denied GitHub Sync worker access for this company because it has no saved GitHub Sync plugin config. Open GitHub Sync settings inside the company and save settings once so the host registers it.';
   const companyId = 'company-scope-denied';
   const worker = await importFreshWorker();
-  const harness = createTestHarness({
-    manifest,
-    config: {
-      githubTokensByCompanyId: {
-        [companyId]: 'ghp_worker_local_fallback_token'
-      }
-    }
-  });
+  const harness = createTestHarness({ manifest });
   await worker.definition.setup(harness.ctx);
   harness.ctx.config.get = async () => {
     throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });

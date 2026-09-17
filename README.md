@@ -221,7 +221,7 @@ The plugin is designed to avoid persisting raw credentials in plugin state.
 - The settings UI also keeps lightweight non-secret identity labels for those saved connections, so later visits can still show who each company GitHub token and board access are connected as.
 - Agents use Paperclip's plugin tool dispatcher for GitHub Sync tools; the settings UI no longer propagates the saved GitHub token into agent environment variables.
 - The worker resolves those secret references at runtime instead of storing raw tokens in plugin state.
-- When the host cannot resolve a saved secret ref (a pre-`2026.831` host that rejected plugin secret refs, or a plugin config row that still holds a pre-`2026.831` bare secret id the host will not bind), GitHub Sync keeps company-scoped worker-local compatibility copies for GitHub tokens and Paperclip board-access tokens in `${PAPERCLIP_HOME:-~/.paperclip}/plugins/github-sync/config.json`. On `2026.831` the settings page detects bare-id refs and re-mirrors them as bindings on the next visit; reconnect board access once after upgrading if sync still cannot authenticate Paperclip label or issue REST calls.
+- If the host cannot resolve a saved secret ref (including a pre-`2026.831` host that rejected plugin secret refs or an unbound legacy bare id), GitHub Sync fails closed and does not make GitHub or authenticated Paperclip REST calls. Open settings in that company to re-mirror the binding or save the connection again.
 - On authenticated Paperclip deployments, sync is blocked until the relevant company has connected Paperclip board access. On local trusted deployments, board access setup remains visible so operators can configure it for host API paths that still require board credentials, but missing board access does not by itself block sync preflight.
 - KPI API route requests must include `Authorization: Bearer <PAPERCLIP_API_KEY>` from an agent run; the Paperclip host authenticates the token and supplies the agent company before the worker records any metric event.
 
@@ -234,29 +234,6 @@ The **GitHub access** section of GitHub Sync settings has an opt-in checkbox, **
 The host matches the name **exactly**, so the plugin looks for a secret named `GITHUB_TOKEN` case-sensitively. Paperclip also derives a unique `key` from a secret's name, so a company that already has a secret named `github_token` (or any other casing) makes the create fail with a conflict; the settings page surfaces that conflict instead of silently rotating the wrong row. Keep the secret's status `active`: the git-credential probe silently skips a disabled or archived secret, and the external-object/merged-PR path fails with an auth error on one.
 
 Leave it unchecked if you want the GitHub credential scoped to the plugin worker only. A secret named `GITHUB_TOKEN` is readable by any host feature and by agent-facing secret surfaces that resolve company secrets by name, which is a wider blast radius than a plugin secret reference bound to GitHub Sync. If you prefer separate credentials, create a `GITHUB_TOKEN` company secret manually with a narrower token instead of ticking the box.
-
-### Optional worker-local token file
-
-Paperclip-managed, company-scoped secret refs are the normal path on Paperclip `2026.831` and newer. If they are not available, the worker can read a local fallback file at `${PAPERCLIP_HOME:-~/.paperclip}/plugins/github-sync/config.json`:
-
-```json
-{
-  "githubToken": "ghp_your_token_here",
-  "githubTokensByCompanyId": {
-    "company-uuid": "ghp_company_specific_token_here"
-  },
-  "paperclipBoardApiTokensByCompanyId": {
-    "company-uuid": "paperclip_board_api_token_here"
-  }
-}
-```
-
-Notes:
-
-- This file is read by the worker only.
-- The raw token is never persisted back into plugin state or plugin config.
-- A GitHub token secret saved through the settings UI is the primary source. Only if the Paperclip host cannot resolve that secret ref for the plugin worker (older hosts that rejected plugin secret refs, or a ref that is not bound to the plugin for that company) does GitHub Sync store the validated token in `githubTokensByCompanyId` as a worker-local compatibility fallback.
-- A Paperclip board access secret saved through the settings UI is also the primary source. If the host cannot resolve it for plugin workers, reconnecting board access stores the approved board token in `paperclipBoardApiTokensByCompanyId` as a worker-local compatibility fallback for direct Paperclip REST calls.
 
 ### Worker-facing Paperclip API URL
 
@@ -445,7 +422,7 @@ The worker deduplicates repeated PR events by preferring the pull request URL, t
 GitHub Sync targets Paperclip `2026.831.1` and adopts the host changes that matter for a multi-company connector:
 
 - **Company-scoped plugin config.** The host now stores one GitHub Sync config row per company and replays each of them to the worker after startup instead of passing a bootstrap config. The worker declares `multiCompanyConfig: true`, keys the delivered config by company, and passes the company id to every config read. Scheduled sync and other proactive paths only get host access for companies that have a saved GitHub Sync config; a company that has mappings but no saved config shows a sync error asking you to open GitHub Sync settings in that company and save once.
-- **Secret refs re-enabled.** Company-scoped secret refs are the normal path again. The settings UI mirrors GitHub tokens and board access tokens into plugin config as `{ "type": "secret_ref", "secretId": "<uuid>" }` bindings, and the worker resolves them with the company id and config path. The worker-local token file remains a compatibility fallback only.
+- **Secret refs re-enabled.** Company-scoped secret refs are the only worker credential path. The settings UI mirrors GitHub tokens and board access tokens into plugin config as `{ "type": "secret_ref", "secretId": "<uuid>" }` bindings, and the worker resolves them with the company id and config path. Resolution failure blocks outbound work.
 - **Tool gateway.** Agent tool discovery and execution now run through the host tool gateway, which applies each company's tool-access policy before a GitHub Sync tool runs. The gateway is fail-closed, so a company with no matching tool profile sees no GitHub Sync tools at all. Tool names are unchanged (`<pluginId>:<tool>`); see [Granting the tools to agents](#granting-the-tools-to-agents) for the profile recipe and the settings-page warning that detects this.
 - **Optional capabilities not adopted.** `2026.831` adds `issue.interactions.read`, `issue.attachments.read`, `approvals.read`, `issue.comments.create_human_attributed`, `issue.interactions.respond`, and `approvals.respond`. GitHub Sync does not use those host surfaces, so it does not declare them; it keeps its existing capability set.
 - **Company export/import does not carry plugin data.** The full-fidelity import/export bundles introduced in `2026.817` describe companies, agents, skills, projects, issues, comments, labels, blobs, documents, work products, monitors and attachments (`packages/shared/src/validators/company-portability.ts`). The manifest has no plugin section at all, so **nothing owned by GitHub Sync survives an export/import**: repository mappings, plugin config and secret refs, issue-link and pull-request-link entities, the import registry, KPI history and the issue interaction ledger are all absent from the bundle, and imported issues keep only their `metadata`. After importing a company, re-open GitHub Sync settings in the target company, save the token and mappings again, and expect the first sync to treat previously imported GitHub issues as new work unless the links are rebuilt. A "re-link imported company" action that rebuilds link entities from the canonical GitHub URLs in issue descriptions and comments is future work, not a shipped feature.
@@ -505,10 +482,10 @@ Example tool payload:
 ## Troubleshooting
 
 - If an older GitHub Sync build fails upgrade with `requires host version 2026.427.0 or newer, but this server is running 0.0.0`, upgrade to a build that removes the strict manifest host-version gate. The host is reporting a development-version sentinel, so the plugin now relies on declared capabilities and runtime fallbacks instead.
-- If setup is reported as incomplete, confirm that a GitHub token has been saved or that `${PAPERCLIP_HOME:-~/.paperclip}/plugins/github-sync/config.json` contains `githubToken`, and make sure at least one mapping has a created Paperclip project or at least one Paperclip issue has been linked to GitHub.
+- If setup is reported as incomplete, confirm that a GitHub token has been saved for the affected company and that at least one mapping has a created Paperclip project or at least one Paperclip issue has been linked to GitHub.
 - If Paperclip says board access is required, open plugin settings inside the affected company and complete the Paperclip board access flow before retrying sync.
 - If GitHub Sync agent tools fail on `/api/plugins/tools` or `/api/plugins/tools/execute`, confirm the Paperclip host is `2026.831.1` or newer, that the tool request includes the agent run context required by Paperclip, and that the company's tool-access policy allows the `paperclip-github-plugin:*` tools for that agent.
-- If the worker logs `Secret is not bound to plugin` or `Invalid secret reference for plugin`, that company's plugin config still holds a pre-`2026.831` bare secret id. Open GitHub Sync settings inside that company so the UI re-mirrors the ref as a `secret_ref` binding, or reconnect the token; until then the worker uses the worker-local fallback copy if one exists.
+- If the worker reports that a secret is not bound to the plugin or is invalid, that company's plugin config may still hold a pre-`2026.831` bare secret id. Open GitHub Sync settings inside that company so the UI re-mirrors the ref as a `secret_ref` binding, or reconnect the token; sync remains blocked until resolution succeeds.
 - If a scheduled sync reports that Paperclip denied worker access for a company, that company has GitHub Sync mappings but no saved plugin config row. Open GitHub Sync settings inside that company and save settings once so the host registers it.
 - If a KPI API route call is rejected, make sure the request includes `Authorization: Bearer ${PAPERCLIP_API_KEY}`, that the token is still valid for the current run, and that any `companyId` in the payload matches the calling agent's company.
 - If the worker reaches an authenticated HTML page instead of the Paperclip API JSON responses it expects, connect Paperclip board access for that company or set **Worker Paperclip API URL** in GitHub Sync settings to a worker-accessible Paperclip API origin.
