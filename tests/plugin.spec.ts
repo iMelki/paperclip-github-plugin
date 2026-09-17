@@ -51,7 +51,7 @@ function resolvedSecretId(input: unknown): string | undefined {
     return undefined;
   }
 
-  const secretRef = (input as { secretRef?: unknown }).secretRef;
+  const secretRef = (input as { secretRef?: unknown }).secretRef ?? input;
   return secretRef && typeof secretRef === 'object' && !Array.isArray(secretRef)
     && (secretRef as { type?: unknown }).type === 'secret_ref'
     && typeof (secretRef as { secretId?: unknown }).secretId === 'string'
@@ -867,6 +867,7 @@ function createProjectFixture(params: {
     leadAgentId: null,
     targetDate: null,
     color: null,
+    icon: null,
     env: null,
     pauseReason: null,
     pausedAt: null,
@@ -4412,7 +4413,7 @@ test('company-scoped plugin config helpers preserve legacy token maps and send e
   assert.throws(() => pluginConfigSaveBody('', {}), /Company context is required/);
 });
 
-test('worker resolves secret bindings through the Paperclip 2026.428 company-scoped contract', async () => {
+test('worker resolves secret bindings through the company-scoped SDK contract', async () => {
   const workerModule = await importFreshWorkerModule();
   const testing = workerModule.__testing as typeof workerModule.__testing & {
     resolveBoundPluginSecret?: (
@@ -4424,22 +4425,21 @@ test('worker resolves secret bindings through the Paperclip 2026.428 company-sco
   };
   assert.equal(typeof testing.resolveBoundPluginSecret, 'function');
 
-  let received: unknown;
+  let receivedSecretRef: unknown;
+  let receivedOptions: unknown;
   const result = await testing.resolveBoundPluginSecret?.({
     secrets: {
-      resolve: async (params: unknown) => {
-        received = params;
+      resolve: async (secretRef: unknown, options?: unknown) => {
+        receivedSecretRef = secretRef;
+        receivedOptions = options;
         return 'resolved-token';
       }
     }
   }, 'company-1', 'githubTokenBinding', { type: 'secret_ref', secretId: 'secret-1' });
 
   assert.equal(result, 'resolved-token');
-  assert.deepEqual(received, {
-    companyId: 'company-1',
-    configPath: 'githubTokenBinding',
-    secretRef: { type: 'secret_ref', secretId: 'secret-1' }
-  });
+  assert.deepEqual(receivedSecretRef, { type: 'secret_ref', secretId: 'secret-1' });
+  assert.deepEqual(receivedOptions, { companyId: 'company-1', configPath: 'githubTokenBinding' });
 });
 
 test('normalizePluginConfig canonicalizes the trusted Paperclip API origin and drops invalid values', () => {
@@ -22734,8 +22734,12 @@ test('sync.runNow falls back to the saved githubTokenRef when config has not pro
   await plugin.definition.setup(harness.ctx);
 
   let resolvedSecretRef: unknown = null;
-  harness.ctx.secrets.resolve = async (secretRef) => {
+  let resolvedSecretOptions: unknown = null;
+  (harness.ctx.secrets as unknown as {
+    resolve(secretRef: unknown, options?: unknown): Promise<string>;
+  }).resolve = async (secretRef, options) => {
     resolvedSecretRef = secretRef;
+    resolvedSecretOptions = options;
     return 'github-token';
   };
 
@@ -22748,11 +22752,8 @@ test('sync.runNow falls back to the saved githubTokenRef when config has not pro
     syncState: { status: string; message?: string; lastRunTrigger?: string };
   };
 
-  assert.deepEqual(resolvedSecretRef, {
-    companyId: 'company-1',
-    configPath: 'githubTokenRef',
-    secretRef: { type: 'secret_ref', secretId: 'github-secret-ref' }
-  });
+  assert.deepEqual(resolvedSecretRef, { type: 'secret_ref', secretId: 'github-secret-ref' });
+  assert.deepEqual(resolvedSecretOptions, { companyId: 'company-1', configPath: 'githubTokenRef' });
   assert.equal(result.syncState.status, 'error');
   assert.equal(result.syncState.message, 'Save at least one mapping with a created Paperclip project before running sync.');
   assert.equal(result.syncState.lastRunTrigger, 'manual');

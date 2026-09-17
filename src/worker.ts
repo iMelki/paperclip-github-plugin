@@ -563,12 +563,14 @@ interface PluginSecretRefBinding {
   version?: string;
 }
 
-interface Paperclip428PluginSecretsClient {
-  resolve(params: {
-    secretRef: PluginSecretRefBinding;
-    companyId: string;
-    configPath: string;
-  }): Promise<string>;
+interface CompanyScopedPluginSecretsClient {
+  resolve(
+    secretRef: PluginSecretRefBinding,
+    options: {
+      companyId: string;
+      configPath: string;
+    }
+  ): Promise<string>;
 }
 
 interface GitHubRepositoryTokenCapabilityAudit {
@@ -2736,9 +2738,8 @@ async function resolveBoundPluginSecret(
   configPath: string,
   binding: PluginSecretRefBinding
 ): Promise<string> {
-  const secrets = ctx.secrets as unknown as Paperclip428PluginSecretsClient;
-  return secrets.resolve({
-    secretRef: binding,
+  const secrets = ctx.secrets as unknown as CompanyScopedPluginSecretsClient;
+  return secrets.resolve(binding, {
     companyId,
     configPath
   });
