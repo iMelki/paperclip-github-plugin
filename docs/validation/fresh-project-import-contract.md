@@ -4,7 +4,12 @@ Tracking: [Paperclip #126](https://github.com/iMelki/paperclip/issues/126).
 Source under test: secured plugin `2cff6ee7414ea6dcd4a8982aa5974781d213ce01`.
 
 Run `pnpm test:import-contract` with the package's pinned Node/pnpm versions.
-This dedicated characterization command is separate from the default test command.
+The default `pnpm test` now runs this command first, and hosted CI invokes that
+default gate. The command also runs `scripts/verify-import-contract-gate.mjs`:
+one isolated child must fail with exit 1 at the outer violation ledger after a
+synthetic mutation attempt, then a fresh child must pass with exit 0. Neither
+child contacts GitHub or a live Paperclip instance. Set no proof environment
+variables in normal use; the runner scopes and removes its test-only toggle.
 The fixture reuses `@paperclipai/plugin-sdk/testing`, the real worker, saved
 registration settings, and the public `sync.runNow` action. All GitHub responses
 and secrets are synthetic; it never contacts a live host or account.
@@ -36,6 +41,11 @@ trial, independently qualify the exact host/artifact, recovery path, exact singl
 mapping, input bound, no-dispatch and no-GitHub-write boundaries. Capture stable
 IDs and a fresh readback after both runs. Broader repository rollout and GitHub
 Projects permissions remain separate work.
+
+The ordinary minute-scheduled sync can later activate imported work. A mutex
+around one import action is not a durable no-dispatch boundary. The live pilot
+still needs a persisted, company-scoped quarantine covering every scheduled,
+manual, retry, full-sync and wake path with independently proven release/races.
 
 ## Validation
 
