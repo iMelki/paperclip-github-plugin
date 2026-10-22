@@ -5286,7 +5286,22 @@ function getActiveRunningSyncForScope(companyId?: string): GitHubSyncSettings | 
     return null;
   }
 
-  return materializeScopedSettings(activeRunningSyncState, null, normalizedCompanyId);
+  // The in-memory running settings of this company's own run may not carry its entry in
+  // syncStateByCompanyId yet (first run for the company). Read the live running state for it
+  // instead of the idle default.
+  const activeSettings =
+    normalizedCompanyId !== undefined
+    && activeRunningSyncCompanyId === normalizedCompanyId
+    && !activeRunningSyncState.syncStateByCompanyId?.[normalizedCompanyId]
+      ? {
+          ...activeRunningSyncState,
+          syncStateByCompanyId: {
+            ...(activeRunningSyncState.syncStateByCompanyId ?? {}),
+            [normalizedCompanyId]: activeRunningSyncState.syncState
+          }
+        }
+      : activeRunningSyncState;
+  return materializeScopedSettings(activeSettings, null, normalizedCompanyId);
 }
 
 async function reconcileOrphanedRunningSyncState(
@@ -6314,7 +6329,9 @@ function normalizeCompanyKpiState(value: unknown): CompanyKpiState {
 }
 
 function getScopedSyncState(
-  settings: Pick<GitHubSyncSettings, 'syncState' | 'syncStateByCompanyId'>,
+  settings: Pick<GitHubSyncSettings, 'syncState' | 'syncStateByCompanyId'> & {
+    mappings?: GitHubSyncSettings['mappings'];
+  },
   companyId?: string
 ): SyncRunState {
   const normalizedCompanyId = normalizeCompanyId(companyId);
@@ -6323,7 +6340,34 @@ function getScopedSyncState(
   }
 
   const scopedSyncState = settings.syncStateByCompanyId?.[normalizedCompanyId];
-  return scopedSyncState ? normalizeSyncState(scopedSyncState) : normalizeSyncState(settings.syncState);
+  if (scopedSyncState) {
+    return normalizeSyncState(scopedSyncState);
+  }
+
+  // A company with no saved sync state of its own starts idle. The shared instance-wide syncState
+  // is written by every company's run, so falling back to it would show another company's status,
+  // error text, repository names and rate-limit backoff to this company. Only unscoped reads (no
+  // company id) use the shared state, plus one legacy case below.
+  return isLegacySingleCompanySharedSyncState(settings, normalizedCompanyId)
+    ? normalizeSyncState(settings.syncState)
+    : createIdleSyncState();
+}
+
+// Settings saved before per-company sync state existed keep everything in the shared slot. When no
+// company has an entry of its own yet and every saved mapping belongs to this company, the shared
+// state can only describe this company's syncs, so it still applies (orphaned-run recovery and
+// rate-limit backoff survive the upgrade). Any company's run writes its own entry, which ends this
+// case for every company, so another company's state is never shown here.
+function isLegacySingleCompanySharedSyncState(
+  settings: Pick<GitHubSyncSettings, 'syncStateByCompanyId'> & { mappings?: GitHubSyncSettings['mappings'] },
+  companyId: string
+): boolean {
+  if (Object.keys(settings.syncStateByCompanyId ?? {}).length > 0) {
+    return false;
+  }
+
+  const mappings = settings.mappings ?? [];
+  return mappings.length > 0 && mappings.every((mapping) => normalizeCompanyId(mapping.companyId) === companyId);
 }
 
 function getScopedScheduleFrequencyMinutes(

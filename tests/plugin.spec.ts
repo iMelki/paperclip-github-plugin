@@ -32202,3 +32202,191 @@ test('company-scoped scheduled runs for company A then company B on the same tic
     globalThis.fetch = originalFetch;
   }
 });
+
+const LEAKED_COMPANY_A_REPOSITORY = 'secret-org/private-a';
+const LEAKED_COMPANY_A_MESSAGE = 'QA-A-MSG company A rate limited on secret-org/private-a';
+
+async function seedSharedSyncStateFromCompanyA(
+  harness: ReturnType<typeof createTestHarness>,
+  companyA: string,
+  companyB: string
+): Promise<void> {
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-leak-a', repositoryUrl: LEAKED_COMPANY_A_REPOSITORY, paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: companyA },
+      { id: 'mapping-leak-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  const current = harness.getState(settingsScope) as Record<string, unknown>;
+  const companyASyncState = {
+    status: 'error',
+    message: LEAKED_COMPANY_A_MESSAGE,
+    checkedAt: new Date().toISOString(),
+    lastRunTrigger: 'schedule',
+    syncedIssuesCount: 0,
+    createdIssuesCount: 0,
+    skippedIssuesCount: 0,
+    erroredIssuesCount: 1,
+    errorDetails: {
+      phase: 'listing_github_issues',
+      repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}`,
+      rawMessage: `API rate limit exceeded for ${LEAKED_COMPANY_A_REPOSITORY}`,
+      rateLimitResetAt: new Date(Date.now() + 6 * 60 * 60_000).toISOString(),
+      rateLimitResource: 'core'
+    }
+  };
+  // Company A's run wrote both the shared slot and its own entry. Company B has no entry yet.
+  await harness.ctx.state.set(settingsScope, {
+    ...current,
+    syncState: companyASyncState,
+    syncStateByCompanyId: { [companyA]: companyASyncState }
+  });
+}
+
+test('company B settings and toolbar data with no saved sync state of its own are idle and leak nothing from company A', async () => {
+  const companyA = 'company-leak-a';
+  const companyB = 'company-leak-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  await seedSharedSyncStateFromCompanyA(harness, companyA, companyB);
+
+  const registration = await harness.getData<{ syncState?: { status?: string; message?: string; errorDetails?: unknown } }>(
+    'settings.registration',
+    { companyId: companyB }
+  );
+  const toolbar = await harness.getData<{ syncState?: { status?: string; message?: string; errorDetails?: unknown } }>(
+    'sync.toolbarState',
+    { companyId: companyB }
+  );
+
+  for (const [label, view] of [['settings.registration', registration], ['sync.toolbarState', toolbar]] as const) {
+    assert.equal(view.syncState?.status, 'idle', `${label} for company B must be idle`);
+    assert.equal(view.syncState?.message, undefined, `${label} for company B must carry no message`);
+    assert.equal(view.syncState?.errorDetails, undefined, `${label} for company B must carry no error details`);
+    const serialized = JSON.stringify(view);
+    assert.ok(!serialized.includes('secret-org'), `${label} for company B must not include company A's repository`);
+    assert.ok(!serialized.includes('QA-A-MSG'), `${label} for company B must not include company A's error`);
+  }
+
+  // Reading company B must not have copied company A's state into company B's own entry.
+  const persisted = harness.getState({
+    scopeKind: 'instance',
+    stateKey: 'paperclip-github-plugin-settings'
+  }) as { syncStateByCompanyId?: Record<string, unknown> };
+  assert.ok(!JSON.stringify(persisted.syncStateByCompanyId?.[companyB] ?? null).includes('QA-A-MSG'));
+});
+
+test('company B scheduled run is not blocked by company A rate-limit backoff in the shared sync state', async () => {
+  const companyA = 'company-backoff-a';
+  const companyB = 'company-backoff-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        [companyB]: { type: 'secret_ref', secretId: 'github-secret-ref-backoff-b' }
+      }
+    }
+  });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await seedSharedSyncStateFromCompanyA(harness, companyA, companyB);
+
+  const originalFetch = globalThis.fetch;
+  const githubRequests: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    githubRequests.push(url.pathname);
+    if (url.pathname === '/repos/paperclipai/example-b/issues') {
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-backoff-b',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60_000).toISOString(),
+      companyId: companyB
+    });
+
+    const persisted = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string; message?: string }> };
+    assert.ok(
+      githubRequests.includes('/repos/paperclipai/example-b/issues'),
+      `company B must reach GitHub despite company A's backoff; requests: ${JSON.stringify(githubRequests)}`
+    );
+    assert.ok(!githubRequests.some((path) => path.includes('secret-org')), 'company B must never request company A repositories');
+    assert.equal(persisted.syncStateByCompanyId?.[companyB]?.status, 'success', persisted.syncStateByCompanyId?.[companyB]?.message);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('unscoped toolbar data without a company id still returns the shared sync state', async () => {
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  await seedSharedSyncStateFromCompanyA(harness, 'company-unscoped-a', 'company-unscoped-b');
+
+  const toolbar = await harness.getData<{ syncState?: { status?: string; message?: string } }>('sync.toolbarState', {});
+  assert.equal(toolbar.syncState?.status, 'error');
+  assert.equal(toolbar.syncState?.message, LEAKED_COMPANY_A_MESSAGE);
+});
+
+test('legacy shared sync state stops applying to the only mapped company once another company saved its own state', async () => {
+  const companyA = 'company-links-only-a';
+  const companyB = 'company-mapped-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-only-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  const current = harness.getState(settingsScope) as Record<string, unknown>;
+  // Company A has no mappings but synced third-party links, writing the shared slot and its own entry.
+  const companyASyncState = {
+    status: 'error',
+    message: LEAKED_COMPANY_A_MESSAGE,
+    checkedAt: new Date().toISOString(),
+    lastRunTrigger: 'schedule',
+    errorDetails: { phase: 'listing_github_issues', repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}` }
+  };
+  await harness.ctx.state.set(settingsScope, {
+    ...current,
+    syncState: companyASyncState,
+    syncStateByCompanyId: { [companyA]: companyASyncState }
+  });
+
+  const toolbar = await harness.getData<{ syncState?: { status?: string } }>('sync.toolbarState', { companyId: companyB });
+  assert.equal(toolbar.syncState?.status, 'idle');
+  assert.ok(!JSON.stringify(toolbar).includes('QA-A-MSG'));
+  assert.ok(!JSON.stringify(toolbar).includes('secret-org'));
+});
