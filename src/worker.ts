@@ -7160,11 +7160,13 @@ function refreshImportedIssueRecordForMapping(
   record.companyId = mapping.companyId;
 }
 
+// Paperclip issue ids are unique across companies, so the key leaves out companyId: a legacy
+// entry the run stamps with its company keeps the key it had before the stamp.
 function getImportedIssueRecordKey(entry: ImportedIssueRecord): string {
-  return `${entry.companyId ?? ''}\u0000${entry.paperclipIssueId}\u0000${entry.githubIssueId}`;
+  return `${entry.paperclipIssueId}\u0000${entry.githubIssueId}`;
 }
 
-// Applies only the changes a run made to its start-of-run registry copy (adds, updates, deletes)
+// Applies only the changes a run made since its last saved registry view (adds, updates, deletes)
 // onto a fresh read, so entries others linked, changed or unlinked during the run are kept. An
 // entry the run updated but someone else deleted meanwhile stays deleted.
 function mergeImportRegistryChanges(
@@ -21759,8 +21761,9 @@ async function performSync(
   let updatedDescriptionsCount = 0;
   const recoverableFailures: SyncProcessingFailure[] = [];
   const nextRegistry = [...importRegistry];
-  // Entries are updated in place during the run, so keep a detached copy of the start state.
-  const runStartRegistry: ImportedIssueRecord[] = JSON.parse(JSON.stringify(importRegistry)) as ImportedIssueRecord[];
+  // Entries are updated in place during the run, so keep a detached copy of the run's registry view
+  // as of its last save (the start state until the first save).
+  let runRegistryBaseline: ImportedIssueRecord[] = JSON.parse(JSON.stringify(importRegistry)) as ImportedIssueRecord[];
   // Legacy registry entries (no company id) only join a company's mapping when that company owns
   // the Paperclip issue, checked once per entry and company before any mapping is processed.
   const isLegacyImportedIssueOwned = await collectOwnedLegacyImportedIssues(ctx, importRegistry, mappings);
@@ -21788,7 +21791,11 @@ async function performSync(
 
   async function persistRunImportRegistry(): Promise<void> {
     const freshRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
-    await ctx.state.set(IMPORT_REGISTRY_SCOPE, mergeImportRegistryChanges(runStartRegistry, nextRegistry, freshRegistry));
+    const savedRunView = JSON.parse(JSON.stringify(nextRegistry)) as ImportedIssueRecord[];
+    await ctx.state.set(IMPORT_REGISTRY_SCOPE, mergeImportRegistryChanges(runRegistryBaseline, savedRunView, freshRegistry));
+    // Move the baseline to what this save applied, so an entry the run already saved and someone
+    // else then unlinks is not re-added by the next save.
+    runRegistryBaseline = savedRunView;
   }
 
   async function flushCompanyKpiState(): Promise<void> {
@@ -22865,12 +22872,18 @@ async function startClaimedSync(
       ? resolveTrustedPaperclipApiBaseUrlInput(options.paperclipApiBaseUrl, persistedSettings, config, targetCompanyId)
       : getConfiguredPaperclipApiBaseUrl(persistedSettings, config, targetCompanyId);
 
-  // Compare with the stored value, not the config-materialized one: run saves no longer write the
-  // whole materialized settings record back, so the live URL has to be persisted here.
-  if (nextPaperclipApiBaseUrl !== materializeScopedSettings(persistedSettings, null, targetCompanyId).paperclipApiBaseUrl) {
+  // Compare with the fresh stored value this write lands on, not the config-materialized or
+  // run-start one: run saves no longer write the whole settings record back, so the live URL is
+  // persisted here. A URL someone else saved since the run read settings is kept.
+  const freshSettingsForUrl = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  const storedPaperclipApiBaseUrl = materializeScopedSettings(freshSettingsForUrl, null, targetCompanyId).paperclipApiBaseUrl;
+  if (
+    nextPaperclipApiBaseUrl !== storedPaperclipApiBaseUrl
+    && storedPaperclipApiBaseUrl === materializeScopedSettings(persistedSettings, null, targetCompanyId).paperclipApiBaseUrl
+  ) {
     const nextPersistedSettings = upsertScopedPaperclipApiBaseUrl(
       {
-        ...normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)),
+        ...freshSettingsForUrl,
         updatedAt: new Date().toISOString()
       },
       nextPaperclipApiBaseUrl,

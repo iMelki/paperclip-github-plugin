@@ -34107,3 +34107,323 @@ test('company B KPI event recorded during company A run survives company A run e
     run.restoreFetch();
   }
 });
+
+const BASELINE_REGISTRY_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-import-registry' };
+const BASELINE_SETTINGS_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+
+function openIssueSnapshotResponse(issueNumber: number) {
+  return graphqlResponse({
+    repository: {
+      issue: {
+        number: issueNumber,
+        state: 'OPEN',
+        stateReason: null,
+        comments: { totalCount: 0 },
+        closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+      }
+    }
+  });
+}
+
+// Company-1 sync of the given GitHub issues, held inside one of its registry saves (before the
+// fresh read) so the test can act between two saves.
+async function startRunHeldOnIssue(options: {
+  issueNumbers: number[];
+  // Hold the run inside its Nth import-registry read, which is the fresh read of a registry save.
+  holdOnRegistryRead: number;
+  beforeStart?: (harness: ReturnType<typeof createTestHarness>) => Promise<void>;
+}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({ manifest, config: { githubTokenRef: 'github-secret-ref' } });
+  await worker.definition.setup(harness.ctx);
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-a', repositoryUrl: 'paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId: 'company-1' }
+    ],
+    syncState: { status: 'idle' }
+  });
+  await options.beforeStart?.(harness);
+
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve;
+  });
+  const originalGet = harness.ctx.state.get.bind(harness.ctx.state) as (scope: unknown) => Promise<unknown>;
+  let registryReads = 0;
+  harness.ctx.state.get = (async (scope: { stateKey: string }) => {
+    if (scope.stateKey === BASELINE_REGISTRY_SCOPE.stateKey) {
+      registryReads += 1;
+      if (registryReads === options.holdOnRegistryRead) {
+        markHeld();
+        await released;
+      }
+    }
+    return originalGet(scope);
+  }) as typeof harness.ctx.state.get;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse(options.issueNumbers.map((number) => ({
+        id: number * 100 + 1,
+        number,
+        title: `Issue ${number}`,
+        body: `Body ${number}`,
+        html_url: `https://github.com/paperclipai/example-repo/issues/${number}`,
+        state: 'open',
+        comments: 0
+      })));
+    }
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse(options.issueNumbers.map((issueNumber) => ({ issueNumber })));
+      }
+      if (query.includes('query GitHubRepositoryOpenIssueLinkedPullRequests')) {
+        return graphqlResponse({
+          repository: {
+            issues: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: options.issueNumbers.map((number) => ({
+                number,
+                closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+              }))
+            }
+          }
+        });
+      }
+      if (query.includes('query GitHubIssueStatusSnapshot')) {
+        return openIssueSnapshotResponse(Number(variables.issueNumber));
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  const runResult = harness.performAction('sync.runNow', { companyId: 'company-1', waitForCompletion: true }) as Promise<{
+    syncState: { status?: string; message?: string };
+  }>;
+  const firstOutcome = await Promise.race([held.then(() => 'held'), runResult.then(() => 'finished', () => 'finished')]);
+  return {
+    harness,
+    runResult,
+    held: firstOutcome === 'held',
+    release,
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('(a) an issue the run already saved and that is unlinked mid-run stays unlinked after the run saves again', async () => {
+  const run = await startRunHeldOnIssue({ issueNumbers: [24, 25], holdOnRegistryRead: 3 });
+  try {
+    assert.ok(run.held, 'the run is held inside a registry save');
+    const savedMidRun = (run.harness.getState(BASELINE_REGISTRY_SCOPE) ?? []) as Array<{ githubIssueNumber?: number; paperclipIssueId: string }>;
+    const issue24 = savedMidRun.find((entry) => entry.githubIssueNumber === 24);
+    assert.ok(issue24, `the run saved #24 before #25: ${JSON.stringify(savedMidRun)}`);
+
+    const unlinked = await run.harness.performAction('issue.unlinkGitHubItem', { companyId: 'company-1', issueId: issue24.paperclipIssueId }) as {
+      removedImportRegistryEntriesCount?: number;
+    };
+    assert.equal(unlinked.removedImportRegistryEntriesCount, 1);
+
+    run.release();
+    const result = await run.runResult;
+    assert.equal(result.syncState.status, 'success', result.syncState.message);
+    const after = (run.harness.getState(BASELINE_REGISTRY_SCOPE) ?? []) as Array<{ githubIssueNumber?: number; paperclipIssueId: string }>;
+    assert.ok(after.some((entry) => entry.githubIssueNumber === 25), 'the run saved #25');
+    assert.ok(
+      !after.some((entry) => entry.paperclipIssueId === issue24.paperclipIssueId),
+      `#24 came back after the run saved again: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('(b) a legacy entry the run stamps with its company and that is unlinked before the run saves stays unlinked', async () => {
+  let legacyIssueId = '';
+  const run = await startRunHeldOnIssue({
+    issueNumbers: [24],
+    // Reads: run start, then the run's first save, which writes the entry already stamped with
+    // company-1. Hold before that first save.
+    holdOnRegistryRead: 2,
+    beforeStart: async (harness) => {
+      const issue = await harness.ctx.issues.create({ companyId: 'company-1', projectId: 'project-1', title: 'Issue 24' });
+      legacyIssueId = issue.id;
+      await harness.ctx.state.set(BASELINE_REGISTRY_SCOPE, [
+        {
+          mappingId: 'mapping-a',
+          githubIssueId: 2401,
+          githubIssueNumber: 24,
+          paperclipIssueId: issue.id,
+          importedAt: '2026-04-01T00:00:00.000Z',
+          lastSeenCommentCount: 0,
+          lastSeenGitHubState: 'open'
+        }
+      ]);
+    }
+  });
+  try {
+    assert.ok(run.held, 'the run is held inside a registry save');
+    const unlinked = await run.harness.performAction('issue.unlinkGitHubItem', { companyId: 'company-1', issueId: legacyIssueId }) as {
+      removedImportRegistryEntriesCount?: number;
+    };
+    assert.equal(unlinked.removedImportRegistryEntriesCount, 1);
+    assert.deepEqual(run.harness.getState(BASELINE_REGISTRY_SCOPE), []);
+
+    run.release();
+    const result = await run.runResult;
+    assert.equal(result.syncState.status, 'success', result.syncState.message);
+    const after = (run.harness.getState(BASELINE_REGISTRY_SCOPE) ?? []) as Array<{ paperclipIssueId: string; companyId?: string }>;
+    assert.ok(
+      !after.some((entry) => entry.paperclipIssueId === legacyIssueId),
+      `the stamped legacy entry came back as a new add: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+// Company-1 manual sync held inside its GitHub token lookup, before it saves the live URL.
+async function startRunHeldInTokenLookup(options: {
+  config: Record<string, unknown>;
+  savedSharedUrl: string;
+  savedCompanyUrl?: string;
+  requestedUrl?: string;
+}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({ manifest, config: { githubTokenRef: 'github-secret-ref', ...options.config } });
+  await worker.definition.setup(harness.ctx);
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-a', repositoryUrl: 'paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId: 'company-1' }
+    ],
+    syncState: { status: 'idle' }
+  });
+  await harness.ctx.state.set(BASELINE_SETTINGS_SCOPE, {
+    ...(harness.getState(BASELINE_SETTINGS_SCOPE) as Record<string, unknown>),
+    paperclipApiBaseUrl: options.savedSharedUrl,
+    ...(options.savedCompanyUrl ? { paperclipApiBaseUrlByCompanyId: { 'company-1': options.savedCompanyUrl } } : {})
+  });
+
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve;
+  });
+  const originalResolve = harness.ctx.secrets.resolve.bind(harness.ctx.secrets);
+  let holdNext = true;
+  harness.ctx.secrets.resolve = (async (...args: Parameters<typeof originalResolve>) => {
+    if (holdNext) {
+      holdNext = false;
+      markHeld();
+      await released;
+    }
+    return originalResolve(...args);
+  }) as typeof harness.ctx.secrets.resolve;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  const runResult = harness.performAction('sync.runNow', {
+    companyId: 'company-1',
+    waitForCompletion: true,
+    paperclipApiBaseUrl: options.requestedUrl ?? options.savedSharedUrl
+  }) as Promise<{ syncState: { status?: string; message?: string } }>;
+  const firstOutcome = await Promise.race([held.then(() => 'held'), runResult.then(() => 'finished', () => 'finished')]);
+  return {
+    harness,
+    runResult,
+    held: firstOutcome === 'held',
+    release,
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('a newer company Paperclip API URL saved while a manual run starts survives the run', async () => {
+  // The run passes the saved shared URL while company-1 has its own URL, so it saves the shared one
+  // for company-1. A newer company-1 URL saved while the run starts must win.
+  const run = await startRunHeldInTokenLookup({
+    config: {},
+    savedSharedUrl: 'http://127.0.0.1:11111',
+    savedCompanyUrl: 'http://127.0.0.1:33333'
+  });
+  try {
+    assert.ok(run.held, 'the run is held in its token lookup');
+    const current = run.harness.getState(BASELINE_SETTINGS_SCOPE) as Record<string, unknown>;
+    await run.harness.ctx.state.set(BASELINE_SETTINGS_SCOPE, {
+      ...current,
+      paperclipApiBaseUrlByCompanyId: { 'company-1': 'http://127.0.0.1:22222' }
+    });
+    run.release();
+    await run.runResult;
+    const after = run.harness.getState(BASELINE_SETTINGS_SCOPE) as { paperclipApiBaseUrlByCompanyId?: Record<string, string> };
+    assert.equal(after.paperclipApiBaseUrlByCompanyId?.['company-1'], 'http://127.0.0.1:22222', 'the newer company URL was overwritten');
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('the live Paperclip API URL save keeps another company mapping saved while the run starts', async () => {
+  const run = await startRunHeldInTokenLookup({
+    config: { paperclipApiBaseUrl: 'http://127.0.0.1:63675' },
+    savedSharedUrl: 'http://127.0.0.1:11111',
+    requestedUrl: 'http://127.0.0.1:63675'
+  });
+  try {
+    assert.ok(run.held, 'the run is held in its token lookup');
+    const current = run.harness.getState(BASELINE_SETTINGS_SCOPE) as { mappings: unknown[] } & Record<string, unknown>;
+    await run.harness.ctx.state.set(BASELINE_SETTINGS_SCOPE, {
+      ...current,
+      mappings: [
+        ...current.mappings,
+        { id: 'mapping-b', repositoryUrl: 'https://github.com/paperclipai/b-repo-2', paperclipProjectName: 'B2', paperclipProjectId: 'project-b2', companyId: 'company-2' }
+      ]
+    });
+    run.release();
+    await run.runResult;
+    const after = run.harness.getState(BASELINE_SETTINGS_SCOPE) as {
+      mappings: Array<{ repositoryUrl: string }>;
+      paperclipApiBaseUrlByCompanyId?: Record<string, string>;
+    };
+    assert.equal(after.paperclipApiBaseUrlByCompanyId?.['company-1'], 'http://127.0.0.1:63675', 'the run saved its live URL');
+    assert.ok(
+      after.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')),
+      `the live URL save dropped another company mapping: ${JSON.stringify(after.mappings)}`
+    );
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
