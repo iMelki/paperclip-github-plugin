@@ -426,6 +426,12 @@ The `sync.github-issues` job is declared with `scope: 'company'`. Paperclip host
 
 Sync status is kept per company everywhere, not only for the schedule. A company that has not synced yet shows an idle state in its settings page and toolbar, with no error text, repository names or rate-limit backoff from another company, and another company's backoff never blocks its runs. Only views with no company context show the shared instance-wide status. There are no exceptions: status saved by older releases only in the shared slot is not shown inside any company, and each company starts idle until its first sync.
 
+Manual sync and cancel are per company as well. The worker runs one sync at a time: when company B asks for a sync while company A's sync is running, B never receives A's result. A waiting request runs B's own sync after A finishes, and a prompt request gets B's own status with a busy message. Company-scoped sync and cancel responses carry only that company's mappings and status. A company can only cancel its own sync; a cancel request with no company keeps the previous instance-wide behavior.
+
+Third-party issue and pull-request links saved without a company id, and repository mappings saved without a company id, are not synced by company-scoped runs, because every company's run would otherwise process them with its own token. They still sync on runs with no company context. On a host from Paperclip dev `806dd81e` or later, re-save these links and mappings inside their company.
+
+The worker no longer writes the instance-wide `paperclip-github-plugin-last-sync` state key, which nothing read and which held whichever company synced last.
+
 A scheduled run never starts a second sync while one is still going. If a sync is live in the worker, the run waits for the next tick. If the shared status still says a sync is running but the worker restarted, that interrupted sync is marked as stopped and no company sync starts on that tick.
 
 Older hosts ignore the `scope` key and never pass `job.companyId`, so the job runs once as an instance job and loops over every company, as before. Repository mappings saved without a company id only sync on those instance runs; on a newer host, re-save them inside their company.
