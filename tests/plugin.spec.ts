@@ -31975,3 +31975,142 @@ test('exposing the GitHub token requires a company and a token', async () => {
     /A GitHub token is required/
   );
 });
+
+test('manifest declares sync.github-issues as a company-scoped job so the host fans out one run per company', () => {
+  const job = manifest.jobs?.find((declaration) => declaration.jobKey === 'sync.github-issues') as
+    | ({ scope?: unknown } & NonNullable<typeof manifest.jobs>[number])
+    | undefined;
+  assert.ok(job, 'sync.github-issues job must be declared');
+  assert.equal(job.scope, 'company');
+});
+
+test('company-scoped scheduled sync run only syncs the mappings of job.companyId', async () => {
+  const COMPANY_SCOPE_DENIED_SYNC_MESSAGE =
+    'Paperclip denied GitHub Sync worker access for this company because it has no saved GitHub Sync plugin config. Open GitHub Sync settings inside the company and save settings once so the host registers it.';
+  const companyA = 'company-scope-a';
+  const companyB = 'company-scope-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+  // Every company sync fails fast at config resolution, so no GitHub traffic is needed and
+  // the per-company sync state shows exactly which companies the run touched.
+  harness.ctx.config.get = async () => {
+    throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-scope-a',
+        repositoryUrl: 'paperclipai/example-a',
+        paperclipProjectName: 'Engineering A',
+        paperclipProjectId: 'project-a',
+        companyId: companyA
+      },
+      {
+        id: 'mapping-scope-b',
+        repositoryUrl: 'paperclipai/example-b',
+        paperclipProjectName: 'Engineering B',
+        paperclipProjectId: 'project-b',
+        companyId: companyB
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    }
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  const readSyncState = (companyId: string) => {
+    const settings = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string; message?: string; lastRunTrigger?: string }> };
+    return settings.syncStateByCompanyId?.[companyId];
+  };
+
+  try {
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-company-a',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      companyId: companyA
+    });
+
+    assert.equal(readSyncState(companyA)?.status, 'error');
+    assert.equal(readSyncState(companyA)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+    assert.notEqual(readSyncState(companyB)?.status, 'error', 'company B must not be synced by company A run');
+    assert.notEqual(readSyncState(companyB)?.lastRunTrigger, 'schedule');
+
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-company-other',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      companyId: 'company-without-mappings'
+    });
+    assert.equal(readSyncState('company-without-mappings'), undefined);
+    assert.notEqual(readSyncState(companyB)?.status, 'error', 'a company without mappings must not sync other companies');
+
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-company-b',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      companyId: companyB
+    });
+    assert.equal(readSyncState(companyB)?.status, 'error');
+    assert.equal(readSyncState(companyB)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('instance-scoped scheduled sync run without job.companyId still syncs every company, as on older hosts', async () => {
+  const companyA = 'company-instance-a';
+  const companyB = 'company-instance-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.config.get = async () => {
+    throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-instance-a', repositoryUrl: 'paperclipai/example-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: companyA },
+      { id: 'mapping-instance-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  try {
+    await harness.runJob('sync.github-issues', { trigger: 'schedule', scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString() });
+    const settings = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string }> };
+    assert.equal(settings.syncStateByCompanyId?.[companyA]?.status, 'error');
+    assert.equal(settings.syncStateByCompanyId?.[companyB]?.status, 'error');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

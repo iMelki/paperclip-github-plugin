@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import type { PaperclipPluginManifestV1 } from '@paperclipai/plugin-sdk';
+import type { PaperclipPluginManifestV1, PluginJobDeclaration } from '@paperclipai/plugin-sdk';
 
 import { GITHUB_AGENT_TOOLS } from './github-agent-tools.ts';
 import {
@@ -34,6 +34,21 @@ const COMPANY_SECRET_REF_VALUE_SCHEMA = {
       required: ['type', 'secretId']
     }
   ]
+};
+
+// Paperclip hosts built from dev 806dd81e (paperclip#190) or later read `scope` on job declarations.
+// A `company` job is fanned out once per company that configured the plugin, each run carrying
+// `job.companyId`, so scheduled sync no longer depends on exactly one company having a config row.
+// The published plugin SDK does not type `scope` yet, so this narrow intersection adds just that key.
+// Older hosts strip the unknown key and keep running the job once as an instance job.
+type PluginJobDeclarationWithScope = PluginJobDeclaration & { scope?: 'company' | 'instance' };
+
+const SYNC_GITHUB_ISSUES_JOB: PluginJobDeclarationWithScope = {
+  jobKey: 'sync.github-issues',
+  displayName: 'Sync GitHub issues',
+  description: 'Checks for GitHub issue updates and syncs them on the configured cadence.',
+  schedule: SCHEDULE_TICK_CRON,
+  scope: 'company'
 };
 
 export const manifest: PaperclipPluginManifestV1 = {
@@ -91,14 +106,7 @@ export const manifest: PaperclipPluginManifestV1 = {
       }
     }
   },
-  jobs: [
-    {
-      jobKey: 'sync.github-issues',
-      displayName: 'Sync GitHub issues',
-      description: 'Checks for GitHub issue updates and syncs them on the configured cadence.',
-      schedule: SCHEDULE_TICK_CRON
-    }
-  ],
+  jobs: [SYNC_GITHUB_ISSUES_JOB],
   apiRoutes: [
     {
       routeKey: COMPANY_METRIC_API_ROUTE_KEY,

@@ -21279,6 +21279,29 @@ function shouldRunScheduledSync(settings: GitHubSyncSettings, scheduledAt?: stri
   return now - lastCheckedAt >= settings.scheduleFrequencyMinutes * 60_000;
 }
 
+// Paperclip hosts built from dev 806dd81e (paperclip#190) or later run the company-scoped
+// `sync.github-issues` job once per company and pass that company as `job.companyId`. The published
+// plugin SDK does not type the field yet, so read it narrowly. Older hosts never set it.
+function getJobCompanyId(job: unknown): string | undefined {
+  if (!job || typeof job !== 'object') {
+    return undefined;
+  }
+
+  const companyId = (job as { companyId?: unknown }).companyId;
+  return typeof companyId === 'string' ? normalizeCompanyId(companyId) : undefined;
+}
+
+function selectScheduledSyncTargetsForJobCompany(
+  targets: Array<ResolvedSyncTarget | undefined>,
+  jobCompanyId: string | undefined
+): Array<ResolvedSyncTarget | undefined> {
+  if (!jobCompanyId) {
+    return targets;
+  }
+
+  return targets.filter((target) => normalizeCompanyId(target?.companyId) === jobCompanyId);
+}
+
 async function listScheduledSyncTargets(
   ctx: PluginSetupContext,
   settings: GitHubSyncSettings
@@ -24882,9 +24905,19 @@ const plugin = definePlugin({
     ctx.jobs.register('sync.github-issues', async (job) => {
       const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
       const trigger = job.trigger === 'retry' ? 'retry' : 'schedule';
-      const scheduledTargets = await listScheduledSyncTargets(ctx, settings);
+      const jobCompanyId = getJobCompanyId(job);
+      const scheduledTargets = selectScheduledSyncTargetsForJobCompany(
+        await listScheduledSyncTargets(ctx, settings),
+        jobCompanyId
+      );
 
       if (scheduledTargets.length === 0) {
+        if (jobCompanyId) {
+          // A company-scoped run for a company with no mappings or links has nothing to sync, and
+          // must not fall back to the instance-wide sync that would touch other companies.
+          return;
+        }
+
         const reconciledSettings = await reconcileOrphanedRunningSyncState(ctx);
         if (job.trigger === 'schedule' && !shouldRunScheduledSync(reconciledSettings, job.scheduledAt)) {
           return;
