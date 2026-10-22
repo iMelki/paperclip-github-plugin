@@ -5268,13 +5268,16 @@ function createSetupConfigurationErrorSyncState(
   }
 }
 
+// Sync-state saves re-read the stored settings right before writing and merge in only this
+// scope's sync state. The caller's copy is never written back, so mappings, schedules and other
+// companies' entries saved by anyone else during a run are kept.
 async function saveSettingsSyncState(
   ctx: PluginSetupContext,
-  settings: GitHubSyncSettings,
+  _settings: GitHubSyncSettings,
   syncState: SyncRunState,
   companyId?: string
 ): Promise<GitHubSyncSettings> {
-  const next = upsertScopedSyncState(normalizeSettings(settings), syncState, companyId);
+  const next = upsertScopedSyncState(normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)), syncState, companyId);
 
   await ctx.state.set(SETTINGS_SCOPE, next);
   return materializeScopedSettings(next, null, companyId);
@@ -7155,6 +7158,42 @@ function refreshImportedIssueRecordForMapping(
   record.repositoryUrl = getNormalizedMappingRepositoryUrl(mapping);
   record.paperclipProjectId = mapping.paperclipProjectId;
   record.companyId = mapping.companyId;
+}
+
+function getImportedIssueRecordKey(entry: ImportedIssueRecord): string {
+  return `${entry.companyId ?? ''}\u0000${entry.paperclipIssueId}\u0000${entry.githubIssueId}`;
+}
+
+// Applies only the changes a run made to its start-of-run registry copy (adds, updates, deletes)
+// onto a fresh read, so entries others linked, changed or unlinked during the run are kept. An
+// entry the run updated but someone else deleted meanwhile stays deleted.
+function mergeImportRegistryChanges(
+  runStart: ImportedIssueRecord[],
+  runNext: ImportedIssueRecord[],
+  fresh: ImportedIssueRecord[]
+): ImportedIssueRecord[] {
+  const startByKey = new Map(runStart.map((entry) => [getImportedIssueRecordKey(entry), JSON.stringify(entry)]));
+  const nextKeys = new Set(runNext.map(getImportedIssueRecordKey));
+  const merged = fresh.filter((entry) => {
+    const key = getImportedIssueRecordKey(entry);
+    return !(startByKey.has(key) && !nextKeys.has(key));
+  });
+  for (const entry of runNext) {
+    const key = getImportedIssueRecordKey(entry);
+    const startJson = startByKey.get(key);
+    if (startJson === JSON.stringify(entry)) {
+      continue;
+    }
+
+    const index = merged.findIndex((candidate) => getImportedIssueRecordKey(candidate) === key);
+    if (index !== -1) {
+      merged[index] = entry;
+    } else if (startJson === undefined) {
+      merged.push(entry);
+    }
+  }
+
+  return merged;
 }
 
 function upsertImportedIssueRecord(nextRegistry: ImportedIssueRecord[], record: ImportedIssueRecord): ImportedIssueRecord {
@@ -21615,6 +21654,11 @@ async function performSync(
   const remoteActionRegistry = normalizeRemoteActionRegistry(await ctx.state.get(REMOTE_ACTION_REGISTRY_SCOPE));
   let companyKpiState = normalizeCompanyKpiState(await ctx.state.get(COMPANY_KPI_SCOPE));
   let companyKpiStateDirty = false;
+  const pendingCompanyKpiUpdates: Array<(state: CompanyKpiState) => CompanyKpiState> = [];
+  const applyCompanyKpiUpdate = (apply: (state: CompanyKpiState) => CompanyKpiState): void => {
+    companyKpiState = apply(companyKpiState);
+    pendingCompanyKpiUpdates.push(apply);
+  };
   const token = typeof options.resolvedToken === 'string'
     ? options.resolvedToken
     : await resolveGithubToken(ctx, { companyId: targetCompanyId });
@@ -21715,6 +21759,8 @@ async function performSync(
   let updatedDescriptionsCount = 0;
   const recoverableFailures: SyncProcessingFailure[] = [];
   const nextRegistry = [...importRegistry];
+  // Entries are updated in place during the run, so keep a detached copy of the start state.
+  const runStartRegistry: ImportedIssueRecord[] = JSON.parse(JSON.stringify(importRegistry)) as ImportedIssueRecord[];
   // Legacy registry entries (no company id) only join a company's mapping when that company owns
   // the Paperclip issue, checked once per entry and company before any mapping is processed.
   const isLegacyImportedIssueOwned = await collectOwnedLegacyImportedIssues(ctx, importRegistry, mappings);
@@ -21740,13 +21786,26 @@ async function performSync(
     progress: currentProgress
   });
 
+  async function persistRunImportRegistry(): Promise<void> {
+    const freshRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
+    await ctx.state.set(IMPORT_REGISTRY_SCOPE, mergeImportRegistryChanges(runStartRegistry, nextRegistry, freshRegistry));
+  }
+
   async function flushCompanyKpiState(): Promise<void> {
     if (!companyKpiStateDirty) {
       return;
     }
 
     try {
-      await ctx.state.set(COMPANY_KPI_SCOPE, companyKpiState);
+      // Replay only this run's KPI updates onto a fresh read, so KPI events others recorded
+      // during the run are kept.
+      let freshKpiState = normalizeCompanyKpiState(await ctx.state.get(COMPANY_KPI_SCOPE));
+      for (const apply of pendingCompanyKpiUpdates) {
+        freshKpiState = apply(freshKpiState);
+      }
+      await ctx.state.set(COMPANY_KPI_SCOPE, freshKpiState);
+      companyKpiState = freshKpiState;
+      pendingCompanyKpiUpdates.length = 0;
       companyKpiStateDirty = false;
     } catch (error) {
       ctx.logger.warn('GitHub Sync could not persist company KPI state.', {
@@ -21871,12 +21930,13 @@ async function performSync(
         continue;
       }
 
-      companyKpiState = upsertCompanyBacklogSnapshot(companyKpiState, companyId, {
+      const snapshot = {
         day,
         capturedAt,
         openIssueCount: planned.openIssueCount,
         repositoryCount: planned.repositoryCount
-      });
+      };
+      applyCompanyKpiUpdate((state) => upsertCompanyBacklogSnapshot(state, companyId, snapshot));
       companyKpiStateDirty = true;
     }
   }
@@ -22269,17 +22329,20 @@ async function performSync(
           repositoryMaintainerCache,
           failureContext,
           recoverableFailures,
-          async () => ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry),
+          async () => persistRunImportRegistry(),
           throwIfSyncCancelled,
           async (params) => {
-            const recorded = recordCompanyActivityMetricEvent(companyKpiState, {
+            const event = {
               companyId: params.companyId,
-              metric: 'githubIssuesClosedCount',
+              metric: 'githubIssuesClosedCount' as const,
               eventKey: `${params.repositoryUrl}/issues/${params.githubIssueNumber}:${coerceDate(params.occurredAt).toISOString()}`,
               repositoryUrl: params.repositoryUrl,
               occurredAt: params.occurredAt
-            });
-            companyKpiState = recorded.state;
+            };
+            const recorded = recordCompanyActivityMetricEvent(companyKpiState, event);
+            if (recorded.recorded) {
+              applyCompanyKpiUpdate((state) => recordCompanyActivityMetricEvent(state, event).state);
+            }
             companyKpiStateDirty = companyKpiStateDirty || recorded.recorded;
           },
           async (progress) => {
@@ -22429,7 +22492,7 @@ async function performSync(
           // an unrelated registry array. Establish the durable baseline before
           // any status action so failures and worker restarts cannot consume a
           // trusted comment or lose a pending wake.
-          await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+          await persistRunImportRegistry();
         }
         const synchronizationResult = await synchronizePaperclipIssueStatuses(
           ctx,
@@ -22448,17 +22511,20 @@ async function performSync(
           repositoryMaintainerCache,
           failureContext,
           recoverableFailures,
-          async () => ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry),
+          async () => persistRunImportRegistry(),
           throwIfSyncCancelled,
           async (params) => {
-            const recorded = recordCompanyActivityMetricEvent(companyKpiState, {
+            const event = {
               companyId: params.companyId,
-              metric: 'githubIssuesClosedCount',
+              metric: 'githubIssuesClosedCount' as const,
               eventKey: `${params.repositoryUrl}/issues/${params.githubIssueNumber}:${coerceDate(params.occurredAt).toISOString()}`,
               repositoryUrl: params.repositoryUrl,
               occurredAt: params.occurredAt
-            });
-            companyKpiState = recorded.state;
+            };
+            const recorded = recordCompanyActivityMetricEvent(companyKpiState, event);
+            if (recorded.recorded) {
+              applyCompanyKpiUpdate((state) => recordCompanyActivityMetricEvent(state, event).state);
+            }
             companyKpiStateDirty = companyKpiStateDirty || recorded.recorded;
           },
           async (progress) => {
@@ -22591,7 +22657,7 @@ async function performSync(
         })
       };
       await saveSettingsSyncState(ctx, currentSettings, next.syncState, targetCompanyId);
-      await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+      await persistRunImportRegistry();
       return materializeScopedSettings(
         upsertScopedSyncState(normalizeSettings(currentSettings), next.syncState, targetCompanyId),
         config,
@@ -22610,7 +22676,7 @@ async function performSync(
       lastRunTrigger: trigger
     };
     const next = await saveSettingsSyncState(ctx, currentSettings, nextSyncState, targetCompanyId);
-    await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+    await persistRunImportRegistry();
     return next;
   } catch (error) {
     if (error instanceof SyncCancellationError) {
@@ -22628,7 +22694,7 @@ async function performSync(
         }),
         targetCompanyId
       );
-      await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+      await persistRunImportRegistry();
       return next;
     }
 
@@ -22651,7 +22717,7 @@ async function performSync(
       })
     };
     await saveSettingsSyncState(ctx, currentSettings, next.syncState, targetCompanyId);
-    await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+    await persistRunImportRegistry();
     // Materialize from the settings with this run's final state written to its own scope, so a
     // company-scoped result carries the error state, not the company's stale running entry.
     return materializeScopedSettings(
@@ -22799,10 +22865,12 @@ async function startClaimedSync(
       ? resolveTrustedPaperclipApiBaseUrlInput(options.paperclipApiBaseUrl, persistedSettings, config, targetCompanyId)
       : getConfiguredPaperclipApiBaseUrl(persistedSettings, config, targetCompanyId);
 
-  if (nextPaperclipApiBaseUrl !== currentSettings.paperclipApiBaseUrl) {
+  // Compare with the stored value, not the config-materialized one: run saves no longer write the
+  // whole materialized settings record back, so the live URL has to be persisted here.
+  if (nextPaperclipApiBaseUrl !== materializeScopedSettings(persistedSettings, null, targetCompanyId).paperclipApiBaseUrl) {
     const nextPersistedSettings = upsertScopedPaperclipApiBaseUrl(
       {
-        ...persistedSettings,
+        ...normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)),
         updatedAt: new Date().toISOString()
       },
       nextPaperclipApiBaseUrl,
@@ -24630,6 +24698,7 @@ export function shouldStartWorkerHost(moduleUrl: string, entry = process.argv[1]
 }
 
 export const __testing = {
+  persistCompanyActivityMetricEvent,
   listGitHubPullRequestIssueLinksForMapping,
   listGitHubIssueLinkedPaperclipIssueIdsForMapping,
   buildProjectPullRequestIssueLookup,

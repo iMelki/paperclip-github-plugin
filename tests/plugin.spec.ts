@@ -32585,6 +32585,7 @@ async function startBlockedCompanyASync(options: {
   await companyAStarted;
   return {
     harness,
+    workerModule,
     companyA,
     companyB,
     companyARun,
@@ -33881,6 +33882,225 @@ test('company B status read during company A run never finalizes its orphan or c
     // With nothing live any more, company B's next read recovers its orphan as before.
     const recovered = await run.harness.getData<{ syncState: { status?: string } }>('settings.registration', { companyId: run.companyB });
     assert.notEqual(recovered.syncState.status, 'running');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+const MID_RUN_SETTINGS_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+const MID_RUN_REGISTRY_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-import-registry' };
+const MID_RUN_KPI_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-company-kpis' };
+type MidRunSettings = {
+  mappings: Array<{ repositoryUrl: string; companyId?: string }>;
+  syncState?: { status?: string };
+  syncStateByCompanyId?: Record<string, { status?: string; message?: string }>;
+  scheduleFrequencyMinutesByCompanyId?: Record<string, number>;
+};
+
+async function finishCompanyARun(run: Awaited<ReturnType<typeof startBlockedCompanyASync>>) {
+  run.releaseCompanyA();
+  return run.companyARun;
+}
+
+test('company B mapping and schedule saved during company A run survive company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('settings.saveRegistration', {
+      companyId: run.companyB,
+      mappings: [
+        { id: 'mapping-busy-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: run.companyB },
+        { id: 'mapping-busy-b2', repositoryUrl: 'paperclipai/b-repo-2', paperclipProjectName: 'B2', paperclipProjectId: 'project-b2', companyId: run.companyB }
+      ],
+      scheduleFrequencyMinutes: 99
+    });
+    const midRun = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(midRun.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')), 'company B save landed');
+    assert.equal(midRun.scheduleFrequencyMinutesByCompanyId?.[run.companyB], 99);
+
+    await finishCompanyARun(run);
+    const after = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(
+      after.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')),
+      `company B mapping lost at company A run end: ${JSON.stringify(after.mappings)}`
+    );
+    assert.equal(after.scheduleFrequencyMinutesByCompanyId?.[run.companyB], 99, 'company B schedule lost at company A run end');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B own sync status written during company A run survives company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const current = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings & Record<string, unknown>;
+    await run.harness.ctx.state.set(MID_RUN_SETTINGS_SCOPE, {
+      ...current,
+      syncStateByCompanyId: {
+        ...(current.syncStateByCompanyId ?? {}),
+        [run.companyB]: { status: 'error', message: 'Company B own status written mid-run.', checkedAt: new Date().toISOString() }
+      }
+    });
+    await finishCompanyARun(run);
+    const after = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.equal(after.syncStateByCompanyId?.[run.companyB]?.message, 'Company B own status written mid-run.');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company A own config edit during its run survives its run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('settings.saveRegistration', {
+      companyId: run.companyA,
+      mappings: [
+        { id: 'mapping-busy-a', repositoryUrl: 'secret-org/private-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: run.companyA },
+        { id: 'mapping-busy-a2', repositoryUrl: 'secret-org/private-a-2', paperclipProjectName: 'A2', paperclipProjectId: 'project-a2', companyId: run.companyA }
+      ],
+      scheduleFrequencyMinutes: 45
+    });
+    const result = await finishCompanyARun(run);
+    assert.notEqual(result.syncState.status, 'running');
+    const after = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(
+      after.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/private-a-2')),
+      `company A mapping lost at its own run end: ${JSON.stringify(after.mappings)}`
+    );
+    assert.equal(after.scheduleFrequencyMinutesByCompanyId?.[run.companyA], 45);
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company A cancel during its run never wipes company B mid-run settings save', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('settings.saveRegistration', {
+      companyId: run.companyB,
+      mappings: [
+        { id: 'mapping-busy-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: run.companyB },
+        { id: 'mapping-busy-b2', repositoryUrl: 'paperclipai/b-repo-2', paperclipProjectName: 'B2', paperclipProjectId: 'project-b2', companyId: run.companyB }
+      ],
+      scheduleFrequencyMinutes: 99
+    });
+    await run.harness.performAction('sync.cancel', { companyId: run.companyA });
+    const afterCancel = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(
+      afterCancel.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')),
+      `company A cancel wiped company B mapping: ${JSON.stringify(afterCancel.mappings)}`
+    );
+    assert.equal(afterCancel.scheduleFrequencyMinutesByCompanyId?.[run.companyB], 99, 'company A cancel wiped company B schedule');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B import-registry link added during company A run survives company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    // The same read, upsert and write the issue link action does (linkPaperclipIssueToGitHubIssue).
+    const testing = run.workerModule.__testing as unknown as {
+      upsertImportedIssueRecord: (registry: unknown[], record: Record<string, unknown>) => unknown;
+    };
+    const registry = (run.harness.getState(MID_RUN_REGISTRY_SCOPE) ?? []) as unknown[];
+    testing.upsertImportedIssueRecord(registry, {
+      mappingId: 'mapping-busy-b',
+      githubIssueId: 9009,
+      githubIssueNumber: 9,
+      paperclipIssueId: 'company-b-linked-issue',
+      importedAt: new Date().toISOString(),
+      repositoryUrl: 'https://github.com/paperclipai/example-b',
+      paperclipProjectId: 'project-b',
+      companyId: run.companyB
+    });
+    await run.harness.ctx.state.set(MID_RUN_REGISTRY_SCOPE, registry);
+
+    await finishCompanyARun(run);
+    const after = (run.harness.getState(MID_RUN_REGISTRY_SCOPE) ?? []) as Array<{ paperclipIssueId?: string }>;
+    assert.ok(
+      after.some((entry) => entry.paperclipIssueId === 'company-b-linked-issue'),
+      `company B link lost at company A run end: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B unlink during company A run stays unlinked after company A run end', async () => {
+  const run = await startBlockedCompanyASync({
+    beforeStart: async (harness) => {
+      const issueB = await harness.ctx.issues.create({
+        companyId: 'company-busy-b',
+        projectId: 'project-b',
+        title: 'Company B linked issue',
+        description: 'Linked to GitHub.',
+        status: 'todo'
+      });
+      await harness.ctx.state.set(MID_RUN_REGISTRY_SCOPE, [
+        {
+          mappingId: 'mapping-busy-b',
+          githubIssueId: 9010,
+          githubIssueNumber: 10,
+          paperclipIssueId: issueB.id,
+          importedAt: '2026-04-01T00:00:00.000Z',
+          repositoryUrl: 'https://github.com/paperclipai/example-b',
+          paperclipProjectId: 'project-b',
+          companyId: 'company-busy-b'
+        }
+      ]);
+    }
+  });
+  try {
+    const registry = run.harness.getState(MID_RUN_REGISTRY_SCOPE) as Array<{ paperclipIssueId: string }>;
+    const issueBId = registry[0]!.paperclipIssueId;
+    await run.harness.performAction('issue.unlinkGitHubItem', { companyId: run.companyB, issueId: issueBId });
+    assert.deepEqual(run.harness.getState(MID_RUN_REGISTRY_SCOPE), [], 'company B unlink removed its registry entry');
+
+    await finishCompanyARun(run);
+    const after = (run.harness.getState(MID_RUN_REGISTRY_SCOPE) ?? []) as Array<{ paperclipIssueId?: string }>;
+    assert.ok(
+      !after.some((entry) => entry.paperclipIssueId === issueBId),
+      `company B unlinked entry came back at company A run end: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B KPI event recorded during company A run survives company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const testing = run.workerModule.__testing as unknown as {
+      persistCompanyActivityMetricEvent: (ctx: unknown, params: Record<string, unknown>) => Promise<{ recorded: boolean }>;
+    };
+    const recorded = await testing.persistCompanyActivityMetricEvent(run.harness.ctx, {
+      companyId: run.companyB,
+      metric: 'githubIssuesClosedCount',
+      eventKey: 'company-b-mid-run-event',
+      repositoryUrl: 'https://github.com/paperclipai/example-b',
+      occurredAt: new Date().toISOString()
+    });
+    assert.equal(recorded.recorded, true);
+    const midRun = JSON.stringify(run.harness.getState(MID_RUN_KPI_SCOPE));
+    assert.ok(midRun.includes('company-b-mid-run-event'), 'company B KPI event landed');
+
+    await finishCompanyARun(run);
+    const after = JSON.stringify(run.harness.getState(MID_RUN_KPI_SCOPE));
+    assert.ok(after.includes('company-b-mid-run-event'), `company B KPI event lost at company A run end: ${after}`);
   } finally {
     run.releaseCompanyA();
     await run.companyARun.catch(() => undefined);
