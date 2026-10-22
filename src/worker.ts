@@ -3803,11 +3803,32 @@ async function resolveProjectScopedMappings(
   }
 
   const candidateMappings = mappings.filter((mapping) => mapping.repositoryUrl.trim());
-  const exactMatches = candidateMappings
-    .filter((mapping) =>
-      mapping.paperclipProjectId === projectId &&
-      (!mapping.companyId || mapping.companyId === companyId)
-    )
+  // A mapping saved without a company id is only trusted for a project the caller's company owns.
+  let callerOwnsProject: Promise<boolean> | undefined;
+  const isProjectOwnedByCaller = () => {
+    callerOwnsProject ??= (async () => {
+      try {
+        const project = await ctx.projects.get(projectId, companyId);
+        if (!project) {
+          return false;
+        }
+        const projectCompanyId = normalizeCompanyId((project as { companyId?: unknown }).companyId);
+        return projectCompanyId === undefined || projectCompanyId === companyId;
+      } catch {
+        return false;
+      }
+    })();
+    return callerOwnsProject;
+  };
+  const projectMatches = candidateMappings.filter((mapping) =>
+    mapping.paperclipProjectId === projectId &&
+    (!mapping.companyId || mapping.companyId === companyId)
+  );
+  const exactMatches = (
+    projectMatches.some((mapping) => !mapping.companyId) && !(await isProjectOwnedByCaller())
+      ? projectMatches.filter((mapping) => mapping.companyId === companyId)
+      : projectMatches
+  )
     .map((mapping) => hydrateResolvedProjectMapping(mapping, {
       companyId,
       projectId
@@ -6989,8 +7010,26 @@ function areRepositoriesEqual(
     left.repo.trim().toLowerCase() === right.repo.trim().toLowerCase();
 }
 
-function doesImportedIssueRecordMatchMapping(entry: ImportedIssueRecord, mapping: RepositoryMapping): boolean {
+// Mapping ids default to mapping-1, mapping-2 and so on in every company, so a mapping id match
+// alone never ties an entry to a company. An entry saved with a company id must match the
+// mapping's company. An entry saved without one (legacy) only matches a company's mapping when
+// isLegacyEntryOwned confirms the Paperclip issue belongs to that company.
+type LegacyImportedIssueOwnership = (entry: ImportedIssueRecord, mapping: RepositoryMapping) => boolean;
+
+function doesImportedIssueRecordMatchMapping(
+  entry: ImportedIssueRecord,
+  mapping: RepositoryMapping,
+  isLegacyEntryOwned?: LegacyImportedIssueOwnership
+): boolean {
+  if (entry.companyId && mapping.companyId && entry.companyId !== mapping.companyId) {
+    return false;
+  }
+
   if (entry.mappingId === mapping.id) {
+    if (!entry.companyId && mapping.companyId) {
+      return isLegacyEntryOwned ? isLegacyEntryOwned(entry, mapping) : false;
+    }
+
     return true;
   }
 
@@ -7003,14 +7042,48 @@ function doesImportedIssueRecordMatchMapping(entry: ImportedIssueRecord, mapping
     entry.repositoryUrl === getNormalizedMappingRepositoryUrl(mapping);
 }
 
-function countImportedIssuesForMappings(
+async function collectOwnedLegacyImportedIssues(
+  ctx: PluginSetupContext,
   importRegistry: ImportedIssueRecord[],
   mappings: RepositoryMapping[]
+): Promise<LegacyImportedIssueOwnership> {
+  const ownedKeys = new Set<string>();
+  const checkedKeys = new Set<string>();
+  for (const entry of importRegistry) {
+    if (entry.companyId || !entry.paperclipIssueId) {
+      continue;
+    }
+
+    for (const mapping of mappings) {
+      const companyId = normalizeCompanyId(mapping.companyId);
+      if (!companyId || entry.mappingId !== mapping.id) {
+        continue;
+      }
+
+      const key = `${companyId}:${entry.paperclipIssueId}`;
+      if (checkedKeys.has(key)) {
+        continue;
+      }
+
+      checkedKeys.add(key);
+      if (await createPaperclipIssueOwnershipCheck(ctx, entry.paperclipIssueId, companyId)()) {
+        ownedKeys.add(key);
+      }
+    }
+  }
+
+  return (entry, mapping) => ownedKeys.has(`${normalizeCompanyId(mapping.companyId) ?? ''}:${entry.paperclipIssueId}`);
+}
+
+function countImportedIssuesForMappings(
+  importRegistry: ImportedIssueRecord[],
+  mappings: RepositoryMapping[],
+  isLegacyEntryOwned?: LegacyImportedIssueOwnership
 ): number {
   const uniqueImportedIssueIds = new Set<string>();
 
   for (const entry of importRegistry) {
-    const matchingMapping = mappings.find((mapping) => doesImportedIssueRecordMatchMapping(entry, mapping));
+    const matchingMapping = mappings.find((mapping) => doesImportedIssueRecordMatchMapping(entry, mapping, isLegacyEntryOwned));
     if (!matchingMapping) {
       continue;
     }
@@ -7079,6 +7152,10 @@ function refreshImportedIssueRecordForMapping(
 
 function upsertImportedIssueRecord(nextRegistry: ImportedIssueRecord[], record: ImportedIssueRecord): ImportedIssueRecord {
   const index = nextRegistry.findIndex((entry) => {
+    if (entry.companyId && record.companyId && entry.companyId !== record.companyId) {
+      return false;
+    }
+
     if (entry.paperclipIssueId === record.paperclipIssueId) {
       return true;
     }
@@ -10548,6 +10625,14 @@ async function listImportedPaperclipIssuesForMapping(
       continue;
     }
 
+    // A link saved without a company id only counts for an issue the mapping's company owns.
+    if (
+      !record.data.companyId
+      && !(await createPaperclipIssueOwnershipCheck(ctx, record.paperclipIssueId, mapping.companyId)())
+    ) {
+      continue;
+    }
+
     importedIssuesByGitHubUrl.set(record.data.githubIssueUrl, {
       id: record.paperclipIssueId,
       createdAt: record.createdAt
@@ -11041,7 +11126,8 @@ async function listGitHubPullRequestLinkRecords(
 
 function doesGitHubPullRequestLinkRecordMatchMapping(
   record: GitHubPullRequestLinkRecord,
-  mapping: RepositoryMapping
+  mapping: RepositoryMapping,
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
   if (record.data.repositoryUrl !== getNormalizedMappingRepositoryUrl(mapping)) {
     return false;
@@ -11055,7 +11141,13 @@ function doesGitHubPullRequestLinkRecordMatchMapping(
     return false;
   }
 
-  return Boolean(mapping.companyId && mapping.paperclipProjectId);
+  if (!mapping.companyId || !mapping.paperclipProjectId) {
+    return false;
+  }
+
+  // Two companies can map the same repository, so a link saved without a company id only matches
+  // a mapping whose company owns the linked Paperclip issue.
+  return record.data.companyId ? true : Boolean(isLegacyLinkOwned?.(record, mapping));
 }
 
 function doesGitHubPullRequestLinkRecordMatchTarget(
@@ -11083,6 +11175,45 @@ function doesGitHubPullRequestLinkRecordMatchTarget(
   }
 }
 
+type LegacyLinkOwnership = (record: { paperclipIssueId: string }, mapping: RepositoryMapping) => boolean;
+
+async function collectOwnedLegacyLinks(
+  ctx: PluginSetupContext,
+  records: Array<{ paperclipIssueId: string; data: { companyId?: string; repositoryUrl: string; paperclipProjectId?: string } }>,
+  mappings: RepositoryMapping[]
+): Promise<LegacyLinkOwnership> {
+  const ownedKeys = new Set<string>();
+  const checkedKeys = new Set<string>();
+  for (const record of records) {
+    if (record.data.companyId || !record.paperclipIssueId) {
+      continue;
+    }
+
+    for (const mapping of mappings) {
+      const companyId = normalizeCompanyId(mapping.companyId);
+      if (
+        !companyId
+        || record.data.repositoryUrl !== getNormalizedMappingRepositoryUrl(mapping)
+        || (record.data.paperclipProjectId && record.data.paperclipProjectId !== mapping.paperclipProjectId)
+      ) {
+        continue;
+      }
+
+      const key = `${companyId}:${record.paperclipIssueId}`;
+      if (checkedKeys.has(key)) {
+        continue;
+      }
+
+      checkedKeys.add(key);
+      if (await createPaperclipIssueOwnershipCheck(ctx, record.paperclipIssueId, companyId)()) {
+        ownedKeys.add(key);
+      }
+    }
+  }
+
+  return (record, mapping) => ownedKeys.has(`${normalizeCompanyId(mapping.companyId) ?? ''}:${record.paperclipIssueId}`);
+}
+
 async function listGitHubPullRequestIssueLinksForMapping(
   ctx: PluginSetupContext,
   mapping: RepositoryMapping,
@@ -11092,10 +11223,11 @@ async function listGitHubPullRequestIssueLinksForMapping(
     ...(target?.kind === 'issue' && target.issueId ? { paperclipIssueId: target.issueId } : {})
   });
   const recordsByKey = new Map<string, GitHubPullRequestLinkRecord>();
+  const isLegacyLinkOwned = await collectOwnedLegacyLinks(ctx, records, [mapping]);
 
   for (const record of records) {
     if (
-      !doesGitHubPullRequestLinkRecordMatchMapping(record, mapping)
+      !doesGitHubPullRequestLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned)
       || !doesGitHubPullRequestLinkRecordMatchTarget(record, target)
     ) {
       continue;
@@ -11130,9 +11262,10 @@ async function listGitHubIssueLinkedPaperclipIssueIdsForMapping(
   const issueLinks = await listGitHubIssueLinkRecords(ctx, {
     ...(target?.kind === 'issue' && target.issueId ? { paperclipIssueId: target.issueId } : {})
   });
+  const isLegacyLinkOwned = await collectOwnedLegacyLinks(ctx, issueLinks, [mapping]);
   for (const record of issueLinks) {
     if (
-      doesGitHubIssueLinkRecordMatchMapping(record, mapping)
+      doesGitHubIssueLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned)
       && doesGitHubIssueLinkRecordMatchTarget(record, target)
     ) {
       issueIds.add(record.paperclipIssueId);
@@ -11144,7 +11277,8 @@ async function listGitHubIssueLinkedPaperclipIssueIdsForMapping(
 
 function doesGitHubIssueLinkRecordMatchMapping(
   record: GitHubIssueLinkRecord,
-  mapping: RepositoryMapping
+  mapping: RepositoryMapping,
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
   if (record.data.repositoryUrl !== getNormalizedMappingRepositoryUrl(mapping)) {
     return false;
@@ -11158,7 +11292,13 @@ function doesGitHubIssueLinkRecordMatchMapping(
     return false;
   }
 
-  return Boolean(mapping.companyId && mapping.paperclipProjectId);
+  if (!mapping.companyId || !mapping.paperclipProjectId) {
+    return false;
+  }
+
+  // Two companies can map the same repository, so a link saved without a company id only matches
+  // a mapping whose company owns the linked Paperclip issue.
+  return record.data.companyId ? true : Boolean(isLegacyLinkOwned?.(record, mapping));
 }
 
 function doesGitHubIssueLinkRecordMatchTarget(
@@ -11188,16 +11328,18 @@ function doesGitHubIssueLinkRecordMatchTarget(
 
 function isGitHubIssueLinkCoveredByMappings(
   record: GitHubIssueLinkRecord,
-  mappings: RepositoryMapping[]
+  mappings: RepositoryMapping[],
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
-  return mappings.some((mapping) => doesGitHubIssueLinkRecordMatchMapping(record, mapping));
+  return mappings.some((mapping) => doesGitHubIssueLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned));
 }
 
 function isGitHubPullRequestLinkCoveredByMappings(
   record: GitHubPullRequestLinkRecord,
-  mappings: RepositoryMapping[]
+  mappings: RepositoryMapping[],
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
-  return mappings.some((mapping) => doesGitHubPullRequestLinkRecordMatchMapping(record, mapping));
+  return mappings.some((mapping) => doesGitHubPullRequestLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned));
 }
 
 async function listExternalGitHubLinkSyncWork(
@@ -11218,13 +11360,15 @@ async function listExternalGitHubLinkSyncWork(
     })
   ]);
 
+  const isLegacyIssueLinkOwned = await collectOwnedLegacyLinks(ctx, issueLinks, syncableMappings);
+  const isLegacyPullRequestLinkOwned = await collectOwnedLegacyLinks(ctx, pullRequestLinks, syncableMappings);
   for (const record of issueLinks) {
     if (!doesGitHubIssueLinkRecordMatchTarget(record, target)) {
       continue;
     }
 
     issueLinkedPaperclipIssueIds.add(record.paperclipIssueId);
-    if (isGitHubIssueLinkCoveredByMappings(record, syncableMappings)) {
+    if (isGitHubIssueLinkCoveredByMappings(record, syncableMappings, isLegacyIssueLinkOwned)) {
       continue;
     }
 
@@ -11238,7 +11382,7 @@ async function listExternalGitHubLinkSyncWork(
     if (
       !doesGitHubPullRequestLinkRecordMatchTarget(record, target)
       || issueLinkedPaperclipIssueIds.has(record.paperclipIssueId)
-      || isGitHubPullRequestLinkCoveredByMappings(record, syncableMappings)
+      || isGitHubPullRequestLinkCoveredByMappings(record, syncableMappings, isLegacyPullRequestLinkOwned)
     ) {
       continue;
     }
@@ -14870,12 +15014,21 @@ async function reconcileTransferredImportedIssues(
         transferredRepository: transfer.transferredRepository,
         paperclipApiBaseUrl: params.paperclipApiBaseUrl
       });
+      const sourceCompanyId = normalizeCompanyId(params.sourceMapping.companyId);
+      const isTransferredIssueOwned = sourceCompanyId
+        ? createPaperclipIssueOwnershipCheck(ctx, importedIssue.paperclipIssueId, sourceCompanyId)
+        : async () => true;
       for (let index = params.nextRegistry.length - 1; index >= 0; index -= 1) {
         const entry = params.nextRegistry[index];
-        if (
-          entry?.paperclipIssueId === importedIssue.paperclipIssueId &&
-          (!entry.companyId || entry.companyId === params.sourceMapping.companyId)
-        ) {
+        if (entry?.paperclipIssueId !== importedIssue.paperclipIssueId) {
+          continue;
+        }
+
+        // Only this company's entries, or a legacy entry for an issue this company owns.
+        const removable = entry.companyId
+          ? entry.companyId === sourceCompanyId
+          : await isTransferredIssueOwned();
+        if (removable) {
           params.nextRegistry.splice(index, 1);
         }
       }
@@ -18475,6 +18628,11 @@ async function buildProjectPullRequestIssueLookup(
       continue;
     }
 
+    // A link saved without a company id only counts for an issue in this company's project.
+    if (!record.data.companyId && !issuesById.has(record.paperclipIssueId)) {
+      continue;
+    }
+
     const linkedIssue = issuesById.get(record.paperclipIssueId);
     linkedIssuesByGitHubIssueUrl.set(
       record.data.githubIssueUrl,
@@ -18531,6 +18689,10 @@ async function buildProjectPullRequestIssueLookup(
     }
 
     if (fallbackIssuesByPullRequestNumber.has(record.data.githubPullRequestNumber)) {
+      continue;
+    }
+
+    if (!record.data.companyId && !issuesById.has(record.paperclipIssueId)) {
       continue;
     }
 
@@ -21546,6 +21708,9 @@ async function performSync(
   let updatedDescriptionsCount = 0;
   const recoverableFailures: SyncProcessingFailure[] = [];
   const nextRegistry = [...importRegistry];
+  // Legacy registry entries (no company id) only join a company's mapping when that company owns
+  // the Paperclip issue, checked once per entry and company before any mapping is processed.
+  const isLegacyImportedIssueOwned = await collectOwnedLegacyImportedIssues(ctx, importRegistry, mappings);
   const companyLabelDirectoryCache = new Map<string, PaperclipLabelDirectory>();
   const repositoryMaintainerCache = new Map<string, boolean>();
   const supportsPaperclipLabelMapping =
@@ -21721,7 +21886,7 @@ async function performSync(
         const repository = requireRepositoryReference(mapping.repositoryUrl);
         octokitLogContext.repositoryUrl = repository.url;
         const importedIssueRecords = nextRegistry
-          .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping))
+          .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping, isLegacyImportedIssueOwned))
           .filter((entry) => doesImportedIssueMatchTarget(entry, options.target));
         const shouldLoadClosedIssues = options.target?.kind === 'issue' || importedIssueRecords.length > 0;
         currentProgress = {
@@ -21894,7 +22059,7 @@ async function performSync(
         const existingImportedPaperclipIssuesByUrl = await listImportedPaperclipIssuesForMapping(ctx, mapping);
         const importRegistryByIssueId = new Map(
           nextRegistry
-            .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping))
+            .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping, isLegacyImportedIssueOwned))
             .filter((entry) => doesImportedIssueMatchTarget(entry, options.target))
             .map((entry) => [entry.githubIssueId, entry])
         );
@@ -24458,6 +24623,12 @@ export function shouldStartWorkerHost(moduleUrl: string, entry = process.argv[1]
 }
 
 export const __testing = {
+  listGitHubPullRequestIssueLinksForMapping,
+  listGitHubIssueLinkedPaperclipIssueIdsForMapping,
+  buildProjectPullRequestIssueLookup,
+  listImportedPaperclipIssuesForMapping,
+  resolveProjectScopedMappings,
+  upsertImportedIssueRecord,
   resolveGitHubToolRepository,
   resolveGitHubPullRequestToolTarget,
   doesGitHubIssueLinkRecordMatchTarget,
@@ -24579,7 +24750,14 @@ const plugin = definePlugin({
       return {
         ...getPublicSettingsForScope(settingsForResponse, requestedCompanyId),
         ...(includeAssignees ? { availableAssignees } : {}),
-        totalSyncedIssuesCount: countImportedIssuesForMappings(importRegistry, scopedMappings),
+        totalSyncedIssuesCount: countImportedIssuesForMappings(
+          importRegistry,
+          scopedMappings,
+          // The unscoped instance view keeps counting legacy entries; a company only counts its own.
+          requestedCompanyId
+            ? await collectOwnedLegacyImportedIssues(ctx, importRegistry, scopedMappings)
+            : () => true
+        ),
         agentToolAccess,
         paperclipApiBaseUrlConfigured: Boolean(normalizePaperclipApiBaseUrl(config.paperclipApiBaseUrl)),
         githubTokenConfigured,

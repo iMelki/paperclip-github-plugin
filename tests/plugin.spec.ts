@@ -33109,3 +33109,529 @@ test('a manual company-scoped sync.runNow skips while that company rate-limit pa
     globalThis.fetch = originalFetch;
   }
 });
+
+async function setupTwoCompaniesSharingMappingId(options: { entryCompanyId?: string; sameRepository?: boolean } = {}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-a': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID },
+        'company-b': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  const repositoryA = 'https://github.com/paperclipai/a-repo';
+  const repositoryB = options.sameRepository ? repositoryA : 'https://github.com/paperclipai/b-repo';
+  // Both companies saved their first mapping, so both carry the default id mapping-1.
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-settings' },
+    {
+      mappings: [
+        { id: 'mapping-1', repositoryUrl: repositoryA, paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: 'company-a' },
+        { id: 'mapping-1', repositoryUrl: repositoryB, paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: 'company-b' }
+      ],
+      syncState: { status: 'idle' }
+    }
+  );
+  const issueA = await harness.ctx.issues.create({
+    companyId: 'company-a',
+    projectId: 'project-a',
+    title: 'Company A imported issue',
+    description: 'Imported from GitHub.',
+    status: 'todo'
+  });
+  const entryA = {
+    mappingId: 'mapping-1',
+    githubIssueId: 5100,
+    githubIssueNumber: 51,
+    paperclipIssueId: issueA.id,
+    importedAt: '2026-04-10T08:00:00.000Z',
+    lastSeenCommentCount: 0,
+    lastSeenGitHubState: 'open',
+    ...(options.entryCompanyId ? { companyId: options.entryCompanyId } : {})
+  };
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' },
+    [entryA]
+  );
+  const requestedPaths: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    requestedPaths.push(url.pathname);
+    if (url.pathname === '/repos/paperclipai/a-repo/issues' || url.pathname === '/repos/paperclipai/b-repo/issues') {
+      return jsonResponse([]);
+    }
+    const transferred = /^\/repos\/paperclipai\/(a-repo|b-repo)\/issues\/51$/.exec(url.pathname);
+    if (transferred) {
+      // Issue #51 in this repository was transferred to an unmapped repository.
+      return jsonResponse({
+        id: 5100,
+        number: 3,
+        title: 'Transferred unmapped issue',
+        body: 'Moved outside configured sync.',
+        html_url: 'https://github.com/outside/unmapped-repo/issues/3',
+        state: 'open',
+        comments: 0,
+        labels: []
+      });
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+  return {
+    harness,
+    issueA,
+    entryA,
+    testing: workerModule.__testing as unknown as Record<string, (...args: any[]) => any>,
+    requestedPaths,
+    registry: () =>
+      (harness.getState({ scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' }) ?? []) as Array<Record<string, unknown>>,
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('company B sync never deletes company A legacy registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId();
+  try {
+    await fixture.harness.performAction('sync.runNow', { companyId: 'company-b', waitForCompletion: true });
+    assert.ok(
+      fixture.registry().some((entry) => entry.paperclipIssueId === fixture.issueA.id),
+      `company A registry entry was removed: ${JSON.stringify(fixture.registry())}`
+    );
+    assert.ok(
+      !fixture.requestedPaths.includes('/repos/paperclipai/b-repo/issues/51'),
+      `company B queried its repository for company A entry: ${JSON.stringify(fixture.requestedPaths)}`
+    );
+    assert.equal((await fixture.harness.ctx.issues.get(fixture.issueA.id, 'company-a'))?.status, 'todo');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B sync never pulls in company A registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ entryCompanyId: 'company-a' });
+  try {
+    await fixture.harness.performAction('sync.runNow', { companyId: 'company-b', waitForCompletion: true });
+    assert.ok(
+      !fixture.requestedPaths.includes('/repos/paperclipai/b-repo/issues/51'),
+      `company B queried its repository for company A entry: ${JSON.stringify(fixture.requestedPaths)}`
+    );
+    assert.deepEqual(fixture.registry(), [fixture.entryA]);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('a legacy registry entry with no company id still syncs for the company that owns its issue', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId();
+  try {
+    await fixture.harness.performAction('sync.runNow', { companyId: 'company-a', waitForCompletion: true });
+    assert.ok(
+      fixture.requestedPaths.includes('/repos/paperclipai/a-repo/issues/51'),
+      `company A must still evaluate its own legacy entry: ${JSON.stringify(fixture.requestedPaths)}`
+    );
+    assert.ok(
+      !fixture.registry().some((entry) => entry.paperclipIssueId === fixture.issueA.id),
+      'company A own legacy entry is cleaned up after its issue moved to an unmapped repository'
+    );
+    assert.equal((await fixture.harness.ctx.issues.get(fixture.issueA.id, 'company-a'))?.status, 'cancelled');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B synced issue total never counts company A legacy registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId();
+  try {
+    const companyB = await fixture.harness.getData<{ totalSyncedIssuesCount?: number }>('settings.registration', { companyId: 'company-b' });
+    assert.equal(companyB.totalSyncedIssuesCount, 0);
+    const companyA = await fixture.harness.getData<{ totalSyncedIssuesCount?: number }>('settings.registration', { companyId: 'company-a' });
+    assert.equal(companyA.totalSyncedIssuesCount, 1, 'company A still counts its own legacy entry');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B importing the same GitHub issue never overwrites company A registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ entryCompanyId: 'company-a', sameRepository: true });
+  try {
+    const registry = [{ ...fixture.entryA, repositoryUrl: 'https://github.com/paperclipai/a-repo', paperclipProjectId: 'project-a' }];
+    fixture.testing.upsertImportedIssueRecord(registry, {
+      mappingId: 'mapping-1',
+      githubIssueId: 5100,
+      githubIssueNumber: 51,
+      paperclipIssueId: 'company-b-issue',
+      importedAt: '2026-04-11T08:00:00.000Z',
+      repositoryUrl: 'https://github.com/paperclipai/a-repo',
+      paperclipProjectId: 'project-b',
+      companyId: 'company-b'
+    });
+    assert.equal(registry.length, 2, `company A entry was overwritten: ${JSON.stringify(registry)}`);
+    assert.equal(registry[0]?.paperclipIssueId, fixture.issueA.id);
+    assert.equal(registry[0]?.companyId, 'company-a');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B never adopts company A legacy issue link as an existing import for a shared repository', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: 'https://github.com/paperclipai/a-repo/issues/51',
+      data: {
+        repositoryUrl: 'https://github.com/paperclipai/a-repo',
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: 'https://github.com/paperclipai/a-repo/issues/51',
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const mappingFor = (companyId: string, projectId: string) => ({
+      id: 'mapping-1',
+      repositoryUrl: 'https://github.com/paperclipai/a-repo',
+      paperclipProjectName: projectId,
+      paperclipProjectId: projectId,
+      companyId
+    });
+    const companyB = await fixture.testing.listImportedPaperclipIssuesForMapping(fixture.harness.ctx, mappingFor('company-b', 'project-b')) as Map<string, { id: string }>;
+    assert.ok(
+      ![...companyB.values()].some((entry) => entry.id === fixture.issueA.id),
+      `company B adopted company A issue: ${JSON.stringify([...companyB.entries()])}`
+    );
+    const companyA = await fixture.testing.listImportedPaperclipIssuesForMapping(fixture.harness.ctx, mappingFor('company-a', 'project-a')) as Map<string, { id: string }>;
+    assert.equal(companyA.get('https://github.com/paperclipai/a-repo/issues/51')?.id, fixture.issueA.id, 'company A keeps its own legacy link');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B project pull request lookup never names company A issue from a legacy link', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    const repositoryUrl = 'https://github.com/paperclipai/a-repo';
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/issues/51`,
+      data: {
+        repositoryUrl,
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: `${repositoryUrl}/issues/51`,
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const lookupFor = async (companyId: string, projectId: string) => {
+      const lookup = await fixture.testing.buildProjectPullRequestIssueLookup(fixture.harness.ctx, {
+        companyId,
+        projectId,
+        repository: { owner: 'paperclipai', repo: 'a-repo', url: repositoryUrl },
+        mappingCount: 1
+      }) as {
+        linkedIssuesByGitHubIssueUrl: Map<string, { paperclipIssueId: string }>;
+        fallbackIssuesByPullRequestNumber: Map<number, { paperclipIssueId: string }>;
+      };
+      return JSON.stringify([
+        [...lookup.linkedIssuesByGitHubIssueUrl.entries()],
+        [...lookup.fallbackIssuesByPullRequestNumber.entries()]
+      ]);
+    };
+    const companyB = await lookupFor('company-b', 'project-b');
+    assert.ok(!companyB.includes(fixture.issueA.id), `company B lookup names company A issue: ${companyB}`);
+    const companyA = await lookupFor('company-a', 'project-a');
+    assert.ok(companyA.includes(fixture.issueA.id), `company A keeps its own legacy links: ${companyA}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('a project mapping saved without a company id is never resolved for another company project id', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-a': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID },
+        'company-b': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  harness.seed({
+    projects: [createProjectFixture({ id: 'project-a', companyId: 'company-a', name: 'A', repoUrl: 'https://github.com/secret-org/private-a' })]
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-settings' },
+    {
+      mappings: [
+        { id: 'mapping-1', repositoryUrl: 'https://github.com/secret-org/private-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a' }
+      ],
+      syncState: { status: 'idle' }
+    }
+  );
+  const originalFetch = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    requested.push(getRequestUrl(input));
+    if (getRequestUrl(input) === 'https://api.github.com/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('GitHubProjectOpenPullRequestCount')) {
+        return graphqlResponse({ repository: { pullRequests: { totalCount: 4 } } });
+      }
+    }
+    throw new Error(`Unexpected fetch: ${getRequestUrl(input)}`);
+  };
+  try {
+    const companyB = await harness.getData<{ status: string }>('project.pullRequests.count', {
+      companyId: 'company-b',
+      projectId: 'project-a'
+    });
+    assert.equal(companyB.status, 'unmapped', `company B resolved company A legacy mapping: ${JSON.stringify(companyB)}`);
+    assert.deepEqual(requested, [], 'company B must not query company A repository');
+    const companyA = await harness.getData<{ status: string; totalOpenPullRequests: number }>('project.pullRequests.count', {
+      companyId: 'company-a',
+      projectId: 'project-a'
+    });
+    assert.equal(companyA.status, 'ready', 'company A still resolves its own legacy mapping');
+    assert.equal(companyA.totalOpenPullRequests, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a company-scoped sync with a per-issue failure returns its error state, not its stale running entry', async () => {
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({
+    manifest,
+    config: testGitHubSecretRefConfig('company-1')
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: { status: 'idle' }
+  });
+  harness.ctx.issues.create = async () => {
+    throw new Error('Simulated import failure');
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse([
+        {
+          id: 5001,
+          number: 50,
+          title: 'Broken import issue',
+          body: 'Broken body',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/50',
+          state: 'open',
+          comments: 0
+        }
+      ]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([{ issueNumber: 50 }]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+  try {
+    const result = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as { syncState: { status: string; erroredIssuesCount?: number; message?: string } };
+    assert.equal(result.syncState.status, 'error', `scoped partial-failure result: ${JSON.stringify(result.syncState)}`);
+    assert.equal(result.syncState.erroredIssuesCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a link with no company id is rejected when the Paperclip issue lookup throws (fail closed)', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    fixture.harness.ctx.issues.get = async () => {
+      throw new Error('Plugin is not available for this company');
+    };
+    // Failing the whole lookup is fine; returning the legacy link is not.
+    const details = await fixture.harness.getData<Record<string, unknown> | null>('issue.githubDetails', {
+      companyId: 'company-a',
+      issueId: fixture.issueA.id
+    }).catch(() => null);
+    assert.ok(!JSON.stringify(details ?? null).includes('private-a'), `accepted on a lookup error: ${JSON.stringify(details)}`);
+    const repository = await fixture.testing.resolveGitHubToolRepository(fixture.harness.ctx, fixture.runCtxFor('company-a'), {
+      paperclipIssueId: fixture.issueA.id
+    }).catch(() => null);
+    assert.equal(repository, null, `resolved on a lookup error: ${JSON.stringify(repository)}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('doesGitHubPullRequestLinkRecordMatchMapping never takes company A legacy pull request link when both companies map the same repository', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    const repositoryUrl = 'https://github.com/paperclipai/a-repo';
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/issues/51`,
+      data: {
+        repositoryUrl,
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: `${repositoryUrl}/issues/51`,
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const mappingFor = (companyId: string, projectId: string) => ({
+      id: 'mapping-1',
+      repositoryUrl,
+      paperclipProjectName: projectId,
+      paperclipProjectId: projectId,
+      companyId
+    });
+    const pullRequestLinks = async (companyId: string, projectId: string) =>
+      (await fixture.testing.listGitHubPullRequestIssueLinksForMapping(fixture.harness.ctx, mappingFor(companyId, projectId)) as Array<{ paperclipIssueId: string }>)
+        .map((record) => record.paperclipIssueId);
+    const issueIds = async (companyId: string, projectId: string) =>
+      [...(await fixture.testing.listGitHubIssueLinkedPaperclipIssueIdsForMapping(fixture.harness.ctx, mappingFor(companyId, projectId), []) as Set<string>)];
+
+    assert.deepEqual(await pullRequestLinks('company-b', 'project-b'), [], 'pull request links for company B mapping');
+    assert.deepEqual(await pullRequestLinks('company-a', 'project-a'), [fixture.issueA.id], 'company A keeps its own legacy pull request link');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('doesGitHubIssueLinkRecordMatchMapping never takes company A legacy issue link when both companies map the same repository', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    const repositoryUrl = 'https://github.com/paperclipai/a-repo';
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/issues/51`,
+      data: {
+        repositoryUrl,
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: `${repositoryUrl}/issues/51`,
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const mappingFor = (companyId: string, projectId: string) => ({
+      id: 'mapping-1',
+      repositoryUrl,
+      paperclipProjectName: projectId,
+      paperclipProjectId: projectId,
+      companyId
+    });
+    const pullRequestLinks = async (companyId: string, projectId: string) =>
+      (await fixture.testing.listGitHubPullRequestIssueLinksForMapping(fixture.harness.ctx, mappingFor(companyId, projectId)) as Array<{ paperclipIssueId: string }>)
+        .map((record) => record.paperclipIssueId);
+    const issueIds = async (companyId: string, projectId: string) =>
+      [...(await fixture.testing.listGitHubIssueLinkedPaperclipIssueIdsForMapping(fixture.harness.ctx, mappingFor(companyId, projectId), []) as Set<string>)];
+
+    assert.deepEqual(await issueIds('company-b', 'project-b'), [], 'issue links for company B mapping');
+    assert.deepEqual(await issueIds('company-a', 'project-a'), [fixture.issueA.id], 'company A keeps its own legacy issue link');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
