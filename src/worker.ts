@@ -6329,9 +6329,7 @@ function normalizeCompanyKpiState(value: unknown): CompanyKpiState {
 }
 
 function getScopedSyncState(
-  settings: Pick<GitHubSyncSettings, 'syncState' | 'syncStateByCompanyId'> & {
-    mappings?: GitHubSyncSettings['mappings'];
-  },
+  settings: Pick<GitHubSyncSettings, 'syncState' | 'syncStateByCompanyId'>,
   companyId?: string
 ): SyncRunState {
   const normalizedCompanyId = normalizeCompanyId(companyId);
@@ -6339,35 +6337,12 @@ function getScopedSyncState(
     return normalizeSyncState(settings.syncState);
   }
 
+  // A company with no saved sync state of its own always starts idle. The shared instance-wide
+  // syncState is written by every company's run, so falling back to it would show another
+  // company's status, error text, repository names and rate-limit backoff to this company. Only
+  // unscoped reads (no company id) use the shared state. No exceptions.
   const scopedSyncState = settings.syncStateByCompanyId?.[normalizedCompanyId];
-  if (scopedSyncState) {
-    return normalizeSyncState(scopedSyncState);
-  }
-
-  // A company with no saved sync state of its own starts idle. The shared instance-wide syncState
-  // is written by every company's run, so falling back to it would show another company's status,
-  // error text, repository names and rate-limit backoff to this company. Only unscoped reads (no
-  // company id) use the shared state, plus one legacy case below.
-  return isLegacySingleCompanySharedSyncState(settings, normalizedCompanyId)
-    ? normalizeSyncState(settings.syncState)
-    : createIdleSyncState();
-}
-
-// Settings saved before per-company sync state existed keep everything in the shared slot. When no
-// company has an entry of its own yet and every saved mapping belongs to this company, the shared
-// state can only describe this company's syncs, so it still applies (orphaned-run recovery and
-// rate-limit backoff survive the upgrade). Any company's run writes its own entry, which ends this
-// case for every company, so another company's state is never shown here.
-function isLegacySingleCompanySharedSyncState(
-  settings: Pick<GitHubSyncSettings, 'syncStateByCompanyId'> & { mappings?: GitHubSyncSettings['mappings'] },
-  companyId: string
-): boolean {
-  if (Object.keys(settings.syncStateByCompanyId ?? {}).length > 0) {
-    return false;
-  }
-
-  const mappings = settings.mappings ?? [];
-  return mappings.length > 0 && mappings.every((mapping) => normalizeCompanyId(mapping.companyId) === companyId);
+  return scopedSyncState ? normalizeSyncState(scopedSyncState) : createIdleSyncState();
 }
 
 function getScopedScheduleFrequencyMinutes(
@@ -21339,6 +21314,25 @@ function getJobCompanyId(job: unknown): string | undefined {
 // shared instance-wide syncState is still written for older hosts and the global toolbar, but the
 // scoped read falls back to it, so company B would inherit company A's fresh checkedAt from the
 // same fanned-out tick and be skipped. A company with no saved state of its own counts as due.
+// Company-scoped reads never fall back to the shared syncState, so a company with no entry of its
+// own reads idle even while the shared slot says a sync is running. Before a scheduled run starts
+// any company's sync, check the instance level: a live run in this worker (activeSyncPromise or the
+// in-memory running state) means this tick waits, and a persisted shared running flag with no live
+// run is an orphan from a restarted worker, which is finalized here and not restarted on this tick.
+async function isSharedSyncRunningOrOrphaned(ctx: PluginSetupContext): Promise<boolean> {
+  if (activeSyncPromise || activeRunningSyncState?.syncState.status === 'running') {
+    return true;
+  }
+
+  const persistedSettings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  if (normalizeSyncState(persistedSettings.syncState).status !== 'running') {
+    return false;
+  }
+
+  await reconcileOrphanedRunningSyncState(ctx);
+  return true;
+}
+
 async function isCompanyScheduledSyncDue(
   ctx: PluginSetupContext,
   scopedSettings: GitHubSyncSettings,
@@ -24990,6 +24984,10 @@ const plugin = definePlugin({
         }
 
         await startSync(ctx, trigger, { awaitCompletion: true });
+        return;
+      }
+
+      if (await isSharedSyncRunningOrOrphaned(ctx)) {
         return;
       }
 

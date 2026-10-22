@@ -29410,6 +29410,22 @@ test('scheduled job skips while a GitHub rate limit pause is active and resumes 
           rateLimitResource: 'core'
         }
       },
+      // Current releases write the company's own entry as well as the shared slot. A company-scoped
+      // read trusts only its own entry, so the state under test lives there.
+      syncStateByCompanyId: {
+        'company-1': {
+          status: 'error',
+          message: 'REST API rate limit reached while listing GitHub issues for paperclipai/example-repo. Sync paused until 2026-04-09 10:00:00 UTC.',
+          checkedAt: '2026-04-09T09:00:00.000Z',
+          lastRunTrigger: 'schedule',
+          errorDetails: {
+            phase: 'listing_github_issues',
+            repositoryUrl: 'https://github.com/paperclipai/example-repo',
+            rateLimitResetAt: resetAt,
+            rateLimitResource: 'core'
+          }
+        }
+      },
       scheduleFrequencyMinutes: 15,
       updatedAt: '2026-04-09T09:00:00.000Z'
     }
@@ -30467,6 +30483,28 @@ test('settings.registration recovers an orphaned running sync after a worker res
           completedIssueCount: 1,
           totalIssueCount: 3,
           currentIssueNumber: 10
+        }
+      },
+      // Current releases write the company's own entry as well as the shared slot. A company-scoped
+      // read trusts only its own entry, so the state under test lives there.
+      syncStateByCompanyId: {
+        'company-1': {
+          status: 'running',
+          message: 'GitHub sync is running in the background. This page will update when it finishes.',
+          syncedIssuesCount: 3,
+          createdIssuesCount: 1,
+          skippedIssuesCount: 0,
+          erroredIssuesCount: 0,
+          lastRunTrigger: 'manual',
+          progress: {
+            phase: 'syncing',
+            totalRepositoryCount: 1,
+            currentRepositoryIndex: 1,
+            currentRepositoryUrl: 'https://github.com/paperclipai/example-repo',
+            completedIssueCount: 1,
+            totalIssueCount: 3,
+            currentIssueNumber: 10
+          }
         }
       },
       scheduleFrequencyMinutes: 15,
@@ -32357,36 +32395,116 @@ test('unscoped toolbar data without a company id still returns the shared sync s
   assert.equal(toolbar.syncState?.message, LEAKED_COMPANY_A_MESSAGE);
 });
 
-test('legacy shared sync state stops applying to the only mapped company once another company saved its own state', async () => {
-  const companyA = 'company-links-only-a';
-  const companyB = 'company-mapped-b';
+test('a company-scoped read ignores shared sync state even when it is the only mapped company and no company has an entry', async () => {
+  const companyId = 'company-only-mapped';
   const worker = await importFreshWorker();
   const harness = createTestHarness({ manifest });
   await worker.definition.setup(harness.ctx);
-  await harness.performAction('settings.saveRegistration', {
-    mappings: [
-      { id: 'mapping-only-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
-    ],
-    syncState: { status: 'idle' }
-  });
   const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
-  const current = harness.getState(settingsScope) as Record<string, unknown>;
-  // Company A has no mappings but synced third-party links, writing the shared slot and its own entry.
-  const companyASyncState = {
-    status: 'error',
-    message: LEAKED_COMPANY_A_MESSAGE,
-    checkedAt: new Date().toISOString(),
-    lastRunTrigger: 'schedule',
-    errorDetails: { phase: 'listing_github_issues', repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}` }
-  };
+  // Shared-slot-only state, as settings saved before per-company state looked. No exceptions:
+  // the company still reads a fresh idle state.
   await harness.ctx.state.set(settingsScope, {
-    ...current,
-    syncState: companyASyncState,
-    syncStateByCompanyId: { [companyA]: companyASyncState }
+    mappings: [
+      { id: 'mapping-only', repositoryUrl: 'https://github.com/paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId }
+    ],
+    syncState: {
+      status: 'error',
+      message: LEAKED_COMPANY_A_MESSAGE,
+      checkedAt: new Date().toISOString(),
+      lastRunTrigger: 'schedule',
+      errorDetails: {
+        phase: 'listing_github_issues',
+        repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}`,
+        rateLimitResetAt: new Date(Date.now() + 6 * 60 * 60_000).toISOString(),
+        rateLimitResource: 'core'
+      }
+    },
+    scheduleFrequencyMinutes: 15,
+    updatedAt: new Date().toISOString()
   });
 
-  const toolbar = await harness.getData<{ syncState?: { status?: string } }>('sync.toolbarState', { companyId: companyB });
+  const toolbar = await harness.getData<{ syncState?: { status?: string; message?: string; errorDetails?: unknown } }>(
+    'sync.toolbarState',
+    { companyId }
+  );
   assert.equal(toolbar.syncState?.status, 'idle');
+  assert.equal(toolbar.syncState?.message, undefined);
+  assert.equal(toolbar.syncState?.errorDetails, undefined);
   assert.ok(!JSON.stringify(toolbar).includes('QA-A-MSG'));
-  assert.ok(!JSON.stringify(toolbar).includes('secret-org'));
+});
+
+test('company-scoped scheduled run does not start a second sync while the shared slot shows a sync running', async () => {
+  const companyId = 'company-1';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  // The shared slot says a sync is running and the company has no entry of its own.
+  await harness.ctx.state.set(settingsScope, {
+    mappings: [
+      { id: 'mapping-a', repositoryUrl: 'paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId }
+    ],
+    syncState: {
+      status: 'running',
+      message: 'GitHub sync is running in the background. This page will update when it finishes.',
+      syncedIssuesCount: 2,
+      createdIssuesCount: 1,
+      skippedIssuesCount: 0,
+      erroredIssuesCount: 0,
+      lastRunTrigger: 'schedule',
+      progress: {
+        phase: 'syncing',
+        totalRepositoryCount: 1,
+        currentRepositoryIndex: 1,
+        currentRepositoryUrl: 'https://github.com/paperclipai/example-repo',
+        completedIssueCount: 1,
+        totalIssueCount: 2,
+        currentIssueNumber: 10
+      }
+    },
+    scheduleFrequencyMinutes: 15,
+    updatedAt: '2026-04-09T09:00:00.000Z'
+  });
+
+  const originalFetch = globalThis.fetch;
+  let githubRequestCount = 0;
+  globalThis.fetch = async () => {
+    // Any request means a second sync started.
+    githubRequestCount += 1;
+    return jsonResponse([]);
+  };
+
+  try {
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-shared-running',
+      trigger: 'schedule',
+      scheduledAt: '2026-04-09T09:45:00.000Z',
+      companyId
+    });
+
+    assert.equal(githubRequestCount, 0, 'no second sync may start while the shared slot shows a sync running');
+    const saved = harness.getState(settingsScope) as {
+      syncState: { status: string; message?: string; lastRunTrigger?: string };
+      syncStateByCompanyId?: Record<string, { status?: string }>;
+    };
+    // This worker has no live run, so the shared running flag is an orphan from a restarted
+    // worker: it is finalized, and the company is not restarted on the same tick.
+    assert.equal(saved.syncState.status, 'error');
+    assert.match(saved.syncState.message ?? '', /worker restarted/i);
+    assert.equal(saved.syncStateByCompanyId?.[companyId]?.status, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
