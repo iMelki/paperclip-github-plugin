@@ -424,6 +424,8 @@ The `sync.github-issues` job is declared with `scope: 'company'`. Paperclip host
 - syncs only the repository mappings and third-party links of `job.companyId` in that run, and returns without syncing anything when that company has nothing to sync, instead of falling back to an instance-wide sync that would touch other companies;
 - judges whether the run is due only from that company's own saved sync state, so one company's run on a tick never makes another company look already synced. A company with no saved sync state of its own counts as due.
 
+Sync status is kept per company everywhere, not only for the schedule. A company that has not synced yet shows an idle state in its settings page and toolbar, with no error text, repository names or rate-limit backoff from another company, and another company's backoff never blocks its runs. Only views with no company context show the shared instance-wide status. Settings saved by older releases, where no company has its own status yet and every mapping belongs to one company, keep showing that shared status for that company until it syncs again.
+
 Older hosts ignore the `scope` key and never pass `job.companyId`, so the job runs once as an instance job and loops over every company, as before. Repository mappings saved without a company id only sync on those instance runs; on a newer host, re-save them inside their company.
 
 ### Paperclip 2026.831 compatibility boundary
