@@ -141,7 +141,8 @@ test('GitHub workflows let packageManager select the pnpm version', async () => 
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   const ciWorkflow = await readFile(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   const releaseWorkflow = await readFile(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
-  const pnpmWorkspace = await readFile(new URL('../pnpm-workspace.yaml', import.meta.url), 'utf8');
+  const pnpmWorkspace = (await readFile(new URL('../pnpm-workspace.yaml', import.meta.url), 'utf8'))
+    .replace(/\r\n/g, '\n');
 
   assert.match(packageJson.packageManager, /^pnpm@\d+\.\d+\.\d+$/);
   assert.match(ciWorkflow, new RegExp(`pnpm/action-setup@${PNPM_ACTION_SETUP_SHA_PATTERN} # v6`));
