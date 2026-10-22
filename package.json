@@ -34,7 +34,7 @@
     "dev": "node ./scripts/build.mjs --watch",
     "dev:ui": "paperclip-plugin-dev-server --root . --ui-dir dist/ui --port 4177",
     "prepack": "pnpm build",
-    "test": "node --test tests/build-script.spec.mjs && tsx --test tests/git-branch-publisher.spec.ts tests/issue-interactions.spec.ts tests/issue-interactions-integration.spec.ts tests/plugin.spec.ts",
+    "test": "node --test tests/build-script.spec.mjs && tsx --test tests/git-branch-publisher.spec.ts tests/issue-interactions.spec.ts tests/issue-interactions-integration.spec.ts tests/plugin.spec.ts src/ui/index.company-boundary.test.tsx",
     "test:e2e": "pnpm build && pnpm exec playwright install chromium && node ./scripts/e2e/run-paperclip-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "verify:manual": "pnpm build && node ./scripts/e2e/manual-paperclip-verify.mjs"
@@ -51,8 +51,11 @@
   "devDependencies": {
     "@types/node": "24.13.4",
     "@types/react": "19.3.0",
+    "@types/react-dom": "19.2.3",
     "esbuild": "0.28.2",
+    "jsdom": "26.1.0",
     "playwright": "1.63.0",
+    "react-dom": "19.3.0",
     "tsx": "4.23.13",
     "typescript": "7.0.2"
   }
