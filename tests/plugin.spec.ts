@@ -32004,7 +32004,10 @@ test('company-scoped scheduled sync run only syncs the mappings of job.companyId
   assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
   // Every company sync fails fast at config resolution, so no GitHub traffic is needed and
   // the per-company sync state shows exactly which companies the run touched.
+  // Count every config read: any sync attempt, scoped or instance-wide, resolves config first.
+  let configReadCount = 0;
   harness.ctx.config.get = async () => {
+    configReadCount += 1;
     throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });
   };
 
@@ -32056,6 +32059,15 @@ test('company-scoped scheduled sync run only syncs the mappings of job.companyId
     assert.notEqual(readSyncState(companyB)?.status, 'error', 'company B must not be synced by company A run');
     assert.notEqual(readSyncState(companyB)?.lastRunTrigger, 'schedule');
 
+    const readSharedAndScopedSyncState = () => {
+      const settings = harness.getState({
+        scopeKind: 'instance',
+        stateKey: 'paperclip-github-plugin-settings'
+      }) as { syncState?: unknown; syncStateByCompanyId?: unknown };
+      return JSON.parse(JSON.stringify({ syncState: settings.syncState, syncStateByCompanyId: settings.syncStateByCompanyId }));
+    };
+    const syncStateBeforeRunWithoutMappings = readSharedAndScopedSyncState();
+    const configReadsBeforeRunWithoutMappings = configReadCount;
     await syncJobHandler({
       jobKey: 'sync.github-issues',
       runId: 'run-company-other',
@@ -32065,6 +32077,18 @@ test('company-scoped scheduled sync run only syncs the mappings of job.companyId
     });
     assert.equal(readSyncState('company-without-mappings'), undefined);
     assert.notEqual(readSyncState(companyB)?.status, 'error', 'a company without mappings must not sync other companies');
+    // Without the early return, the run falls back to the instance-wide sync, which rewrites the
+    // shared syncState. Neither the shared state nor any company's state may change.
+    assert.deepEqual(
+      readSharedAndScopedSyncState(),
+      syncStateBeforeRunWithoutMappings,
+      'a company without mappings must leave the shared and other-company sync state unchanged'
+    );
+    assert.equal(
+      configReadCount,
+      configReadsBeforeRunWithoutMappings,
+      'a company without mappings must not start any sync, including the instance-wide fallback'
+    );
 
     await syncJobHandler({
       jobKey: 'sync.github-issues',
