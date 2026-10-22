@@ -33635,3 +33635,255 @@ test('doesGitHubIssueLinkRecordMatchMapping never takes company A legacy issue l
     fixture.restoreFetch();
   }
 });
+
+const CANCEL_SETTINGS_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+const CANCEL_REQUEST_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-sync-cancel-request' };
+
+async function seedCompanyEntry(
+  harness: ReturnType<typeof createTestHarness>,
+  companyId: string,
+  syncState: Record<string, unknown>,
+  shared?: Record<string, unknown>
+): Promise<void> {
+  const settings = (harness.getState(CANCEL_SETTINGS_SCOPE) ?? {}) as {
+    syncStateByCompanyId?: Record<string, unknown>;
+  } & Record<string, unknown>;
+  await harness.ctx.state.set(CANCEL_SETTINGS_SCOPE, {
+    ...settings,
+    ...(shared ? { syncState: shared } : {}),
+    syncStateByCompanyId: { ...(settings.syncStateByCompanyId ?? {}), [companyId]: syncState }
+  });
+}
+
+function spyOnSettingsAndCancelWrites(harness: ReturnType<typeof createTestHarness>): { writes: string[]; stop: () => void } {
+  const writes: string[] = [];
+  const watched = new Set([CANCEL_SETTINGS_SCOPE.stateKey, CANCEL_REQUEST_SCOPE.stateKey]);
+  const originalSet = harness.ctx.state.set;
+  const originalDelete = harness.ctx.state.delete;
+  harness.ctx.state.set = (async (scope: { stateKey: string }, value: unknown) => {
+    if (watched.has(scope.stateKey)) writes.push(`set:${scope.stateKey}`);
+    return (originalSet as (scope: unknown, value: unknown) => Promise<void>).call(harness.ctx.state, scope, value);
+  }) as typeof harness.ctx.state.set;
+  harness.ctx.state.delete = (async (scope: { stateKey: string }) => {
+    if (watched.has(scope.stateKey)) writes.push(`delete:${scope.stateKey}`);
+    return (originalDelete as (scope: unknown) => Promise<void>).call(harness.ctx.state, scope);
+  }) as typeof harness.ctx.state.delete;
+  return {
+    writes,
+    stop: () => {
+      harness.ctx.state.set = originalSet;
+      harness.ctx.state.delete = originalDelete;
+    }
+  };
+}
+
+const OLD_FINISHED_ENTRY = {
+  status: 'success',
+  message: 'Old finished run from yesterday.',
+  checkedAt: '2026-04-01T00:00:00.000Z',
+  lastRunTrigger: 'manual',
+  syncedIssuesCount: 3,
+  createdIssuesCount: 0,
+  skippedIssuesCount: 3,
+  erroredIssuesCount: 0
+};
+const OLD_RUNNING_ENTRY = {
+  status: 'running',
+  message: 'Stale running state left by an earlier worker.',
+  checkedAt: '2026-04-01T00:00:00.000Z',
+  lastRunTrigger: 'manual'
+};
+
+test('(a) a company with an old success entry that starts a run and cancels right away sees running and its cancel takes effect', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: testGitHubSecretRefConfig('company-a')
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-1', repositoryUrl: 'paperclipai/a-repo', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: 'company-a' }
+    ],
+    syncState: { status: 'idle' }
+  });
+  await seedCompanyEntry(harness, 'company-a', OLD_FINISHED_ENTRY);
+
+  // Hold the run right after it wrote its running state to storage and before its first progress
+  // save, which is the window where the in-memory copy still carries the old success entry.
+  let armed = true;
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve;
+  });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const originalGet = harness.ctx.state.get;
+  harness.ctx.state.get = (async (scope: { stateKey: string }) => {
+    if (armed && scope.stateKey === 'paperclip-github-plugin-import-registry') {
+      armed = false;
+      markHeld();
+      await released;
+    }
+    return (originalGet as (scope: unknown) => Promise<unknown>).call(harness.ctx.state, scope);
+  }) as typeof harness.ctx.state.get;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/a-repo/issues') {
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  const runA = harness.performAction('sync.runNow', { companyId: 'company-a', waitForCompletion: true }) as Promise<{
+    syncState: { status?: string };
+  }>;
+  try {
+    await held;
+    const status = await harness.getData<{ syncState: { status?: string } }>('settings.registration', { companyId: 'company-a' });
+    assert.equal(status.syncState.status, 'running', `status hides the live run: ${JSON.stringify(status.syncState)}`);
+    const toolbar = await harness.getData<{ syncState?: { status?: string } }>('sync.toolbarState', { companyId: 'company-a' });
+    assert.equal(toolbar.syncState?.status, 'running', `toolbar hides the live run: ${JSON.stringify(toolbar)}`);
+
+    const cancelled = await harness.performAction('sync.cancel', { companyId: 'company-a' }) as {
+      syncState: { status?: string; cancelRequestedAt?: string };
+    };
+    assert.equal(typeof cancelled.syncState.cancelRequestedAt, 'string', `cancel was not queued: ${JSON.stringify(cancelled.syncState)}`);
+    assert.ok(harness.getState(CANCEL_REQUEST_SCOPE), 'the cancellation request is recorded');
+    release();
+    const result = await runA;
+    assert.equal(result.syncState.status, 'cancelled', `the cancel did not take effect: ${JSON.stringify(result.syncState)}`);
+  } finally {
+    release();
+    await runA.catch(() => undefined);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('(b) company A pending cancel survives company B old-running orphan cancel, with zero settings or cancel writes', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const companyACancel = await run.harness.performAction('sync.cancel', { companyId: run.companyA }) as {
+      syncState: { cancelRequestedAt?: string };
+    };
+    assert.equal(typeof companyACancel.syncState.cancelRequestedAt, 'string');
+    const pendingRequest = run.harness.getState(CANCEL_REQUEST_SCOPE);
+    assert.ok(pendingRequest, 'company A cancellation request is pending');
+    await seedCompanyEntry(run.harness, run.companyB, OLD_RUNNING_ENTRY);
+
+    const spy = spyOnSettingsAndCancelWrites(run.harness);
+    let companyBView: Record<string, unknown>;
+    try {
+      companyBView = await run.harness.performAction('sync.cancel', { companyId: run.companyB }) as Record<string, unknown>;
+    } finally {
+      spy.stop();
+    }
+    assert.deepEqual(spy.writes, [], 'company B cancel must not write settings or the cancellation request');
+    assert.deepEqual(run.harness.getState(CANCEL_REQUEST_SCOPE), pendingRequest, 'company A pending cancel must survive');
+    const viewJson = JSON.stringify(companyBView);
+    assert.ok(!viewJson.includes('private-a'), `company B view leaks company A: ${viewJson}`);
+    assert.ok(!('syncStateByCompanyId' in companyBView));
+    assert.deepEqual(
+      (companyBView.mappings as Array<{ companyId?: string }>).map((mapping) => mapping.companyId),
+      [run.companyB]
+    );
+    assert.equal((companyBView.syncState as { status?: string }).status, 'running', 'company B sees its own entry, recovered once company A finishes');
+
+    run.releaseCompanyA();
+    const companyAResult = await run.companyARun;
+    assert.equal(companyAResult.syncState.status, 'cancelled', 'company A run honours its pending cancel');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('(c) company B with no state of its own gets idle and no company A details when it cancels during company A run', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const sharedFromCompanyA = {
+      status: 'error',
+      message: LEAKED_COMPANY_A_MESSAGE,
+      checkedAt: new Date().toISOString(),
+      lastRunTrigger: 'schedule',
+      errorDetails: { repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}`, rawMessage: LEAKED_COMPANY_A_MESSAGE }
+    };
+    await seedCompanyEntry(run.harness, run.companyA, { ...OLD_FINISHED_ENTRY }, sharedFromCompanyA);
+    const settings = run.harness.getState(CANCEL_SETTINGS_SCOPE) as { syncStateByCompanyId: Record<string, unknown> };
+    delete settings.syncStateByCompanyId[run.companyB];
+    await run.harness.ctx.state.set(CANCEL_SETTINGS_SCOPE, settings);
+
+    const view = await run.harness.performAction('sync.cancel', { companyId: run.companyB }) as {
+      syncState: { status?: string; message?: string; errorDetails?: unknown };
+    };
+    assert.equal(view.syncState.status, 'idle', `company B view: ${JSON.stringify(view.syncState)}`);
+    assert.equal(view.syncState.message, undefined);
+    assert.equal(view.syncState.errorDetails, undefined);
+    assert.ok(!JSON.stringify(view).includes('private-a'), `company B view leaks company A: ${JSON.stringify(view)}`);
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('(d) company B orphan cancel with nothing active still finalizes its own stale running entry', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    run.releaseCompanyA();
+    await run.companyARun;
+    await seedCompanyEntry(run.harness, run.companyB, OLD_RUNNING_ENTRY);
+    const result = await run.harness.performAction('sync.cancel', { companyId: run.companyB }) as {
+      syncState: { status?: string };
+    };
+    assert.equal(result.syncState.status, 'cancelled');
+    const settings = run.harness.getState(CANCEL_SETTINGS_SCOPE) as { syncStateByCompanyId: Record<string, { status?: string }> };
+    assert.equal(settings.syncStateByCompanyId[run.companyB]?.status, 'cancelled');
+    assert.ok(!JSON.stringify(result).includes('private-a'));
+  } finally {
+    run.restoreFetch();
+  }
+});
+
+test('company B status read during company A run never finalizes its orphan or clears company A pending cancel', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('sync.cancel', { companyId: run.companyA });
+    const pendingRequest = run.harness.getState(CANCEL_REQUEST_SCOPE);
+    assert.ok(pendingRequest, 'company A cancellation request is pending');
+    await seedCompanyEntry(run.harness, run.companyB, OLD_RUNNING_ENTRY);
+
+    const spy = spyOnSettingsAndCancelWrites(run.harness);
+    let companyBStatus: { syncState: { status?: string } };
+    try {
+      companyBStatus = await run.harness.getData<{ syncState: { status?: string } }>('settings.registration', { companyId: run.companyB });
+    } finally {
+      spy.stop();
+    }
+    assert.deepEqual(spy.writes, [], 'company B status read must not write settings or the cancellation request');
+    assert.deepEqual(run.harness.getState(CANCEL_REQUEST_SCOPE), pendingRequest, 'company A pending cancel must survive');
+    assert.ok(!JSON.stringify(companyBStatus).includes('private-a'));
+
+    run.releaseCompanyA();
+    assert.equal((await run.companyARun).syncState.status, 'cancelled', 'company A run honours its pending cancel');
+    // With nothing live any more, company B's next read recovers its orphan as before.
+    const recovered = await run.harness.getData<{ syncState: { status?: string } }>('settings.registration', { companyId: run.companyB });
+    assert.notEqual(recovered.syncState.status, 'running');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});

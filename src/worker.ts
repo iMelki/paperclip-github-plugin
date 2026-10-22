@@ -5345,13 +5345,13 @@ function getActiveRunningSyncForScope(companyId?: string): GitHubSyncSettings | 
     return null;
   }
 
-  // The in-memory running settings of this company's own run may not carry its entry in
-  // syncStateByCompanyId yet (first run for the company). Read the live running state for it
-  // instead of the idle default.
+  // For this company's own live run, its per-company entry in the in-memory settings can be
+  // missing (first run) or stale (an old success or error entry kept until the first progress
+  // save). Always read the live running state for it, so the run shows as running and its own
+  // cancel is honoured.
   const activeSettings =
     normalizedCompanyId !== undefined
     && activeRunningSyncCompanyId === normalizedCompanyId
-    && !activeRunningSyncState.syncStateByCompanyId?.[normalizedCompanyId]
       ? {
           ...activeRunningSyncState,
           syncStateByCompanyId: {
@@ -5375,6 +5375,13 @@ async function reconcileOrphanedRunningSyncState(
   }
 
   const current = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  if (activeSyncPromise || activeRunningSyncState?.syncState.status === 'running') {
+    // Another scope's run is live in this worker. Finalizing this scope's orphan now would write
+    // the shared settings and clear the one instance-wide cancellation request, dropping the live
+    // run's pending cancel. Read only; the orphan is recovered once the live run finishes.
+    return materializeScopedSettings(current, null, normalizedCompanyId);
+  }
+
   const scopedSyncState = getScopedSyncState(current, normalizedCompanyId);
   if (scopedSyncState.status !== 'running') {
     return materializeScopedSettings(current, null, normalizedCompanyId);
@@ -25236,9 +25243,12 @@ const plugin = definePlugin({
       const liveRunIsActive = activeRunningSyncState?.syncState.status === 'running';
       if (callerCompanyId && liveRunIsActive && activeRunningSyncCompanyId !== callerCompanyId) {
         // A company may only cancel its own run. Another company's (or an unscoped) live run is
-        // left alone; the caller gets its own state, with its own orphaned run (if any) finalized.
+        // left alone, and the caller gets a read-only view of its own state. Orphan recovery is
+        // not run here: it writes the shared settings and clears the one instance-wide
+        // cancellation request, which would drop the live run's pending cancel. The caller's
+        // orphaned run (if any) is recovered once the live run finishes.
         return getPublicSettingsForScope(
-          await reconcileOrphanedRunningSyncState(ctx, callerCompanyId, 'cancelled'),
+          materializeScopedSettings(normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)), null, callerCompanyId),
           callerCompanyId
         );
       }

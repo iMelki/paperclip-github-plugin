@@ -515,7 +515,7 @@ Example tool payload:
 - If a GitHub-linked project does not show the **Pull requests** sidebar entry on Paperclip `2026.831`, that is expected: the streamlined sidebar has no `projectSidebarItem` mount point, so open `/<company-prefix>/github-pull-requests?projectId=<project id>` directly. On hosts that still render project sidebar items, reopen the plugin settings and re-save the mapping. The project pull request surfaces also recover older mappings when saved ids are missing, and they can fall back to the active project's bound GitHub repository when the project already has a GitHub workspace configured.
 - If GitHub rate limiting is hit, the plugin pauses sync until the reported reset time instead of retrying pointlessly.
 - If a manual sync takes longer than the host action window, it continues in the background and updates the UI when it finishes or when a cancellation request stops it.
-- If a sync shows `running` after the worker has restarted, the next settings read, toolbar read, cancel action, or scheduler tick will reconcile that stale run into an interrupted error or a cancelled result so you can retry cleanly.
+- If a sync shows `running` after the worker has restarted, the next settings read, toolbar read, cancel action, or scheduler tick will reconcile that stale run into an interrupted error or a cancelled result so you can retry cleanly. While another company's sync is running, that recovery waits until the running sync finishes, so it never drops the running sync's pending cancel.
 
 ## Development
 
