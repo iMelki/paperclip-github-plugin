@@ -33052,3 +33052,60 @@ test('company B sync.cancel never touches another company run: live run (early r
     orphan.restoreFetch();
   }
 });
+
+test('a manual company-scoped sync.runNow skips while that company rate-limit pause is active', async () => {
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({
+    manifest,
+    config: testGitHubSecretRefConfig('company-1')
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: { status: 'idle' }
+  });
+
+  const resetAtMs = Date.now() + 10 * 60_000;
+  const expectedResetAt = new Date(Math.floor(resetAtMs / 1_000) * 1_000).toISOString();
+  const originalFetch = globalThis.fetch;
+  let githubRequestCount = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      githubRequestCount += 1;
+      return githubRateLimitedResponse({ resetAtMs, resource: 'core' });
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    type RunNowResult = { syncState: { status: string; message?: string; errorDetails?: { rateLimitResetAt?: string } } };
+    const firstAttempt = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as RunNowResult;
+    assert.equal(firstAttempt.syncState.status, 'error');
+    assert.match(firstAttempt.syncState.message ?? '', /rate limit reached/i);
+    assert.equal(firstAttempt.syncState.errorDetails?.rateLimitResetAt, expectedResetAt);
+    assert.equal(githubRequestCount, 1);
+
+    const secondAttempt = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as RunNowResult;
+    assert.equal(secondAttempt.syncState.status, 'error');
+    assert.equal(secondAttempt.syncState.errorDetails?.rateLimitResetAt, expectedResetAt);
+    assert.equal(githubRequestCount, 1, 'a manual company-scoped retry must not call GitHub during the pause');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

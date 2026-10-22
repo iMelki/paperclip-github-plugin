@@ -22420,7 +22420,11 @@ async function performSync(
       };
       await saveSettingsSyncState(ctx, currentSettings, next.syncState, targetCompanyId);
       await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
-      return materializeScopedSettings(next, config, targetCompanyId);
+      return materializeScopedSettings(
+        upsertScopedSyncState(normalizeSettings(currentSettings), next.syncState, targetCompanyId),
+        config,
+        targetCompanyId
+      );
     }
 
     const nextSyncState = {
@@ -22476,7 +22480,13 @@ async function performSync(
     };
     await saveSettingsSyncState(ctx, currentSettings, next.syncState, targetCompanyId);
     await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
-    return materializeScopedSettings(next, config, targetCompanyId);
+    // Materialize from the settings with this run's final state written to its own scope, so a
+    // company-scoped result carries the error state, not the company's stale running entry.
+    return materializeScopedSettings(
+      upsertScopedSyncState(normalizeSettings(currentSettings), next.syncState, targetCompanyId),
+      config,
+      targetCompanyId
+    );
   } finally {
     await flushCompanyKpiState();
   }
