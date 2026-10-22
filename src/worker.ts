@@ -55,11 +55,6 @@ const SETTINGS_SCOPE = {
   stateKey: 'paperclip-github-plugin-settings'
 };
 
-const SYNC_STATE_SCOPE = {
-  scopeKind: 'instance' as const,
-  stateKey: 'paperclip-github-plugin-last-sync'
-};
-
 const SYNC_CANCELLATION_SCOPE = {
   scopeKind: 'instance' as const,
   stateKey: 'paperclip-github-plugin-sync-cancel-request'
@@ -5217,7 +5212,6 @@ async function saveSettingsSyncState(
   const next = upsertScopedSyncState(normalizeSettings(settings), syncState, companyId);
 
   await ctx.state.set(SETTINGS_SCOPE, next);
-  await ctx.state.set(SYNC_STATE_SCOPE, syncState);
   return materializeScopedSettings(next, null, companyId);
 }
 
@@ -11029,14 +11023,17 @@ function doesGitHubPullRequestLinkRecordMatchTarget(
   }
 
   switch (target.kind) {
+    // Scoped runs only process links saved with their company. A link with no company id would
+    // otherwise be synced by every company's run with that company's token. It still syncs on
+    // unscoped runs; re-save it inside its company to sync it on scoped runs.
     case 'company':
-      return !record.data.companyId || record.data.companyId === target.companyId;
+      return record.data.companyId === target.companyId;
     case 'project':
-      return (!record.data.companyId || record.data.companyId === target.companyId)
+      return record.data.companyId === target.companyId
         && (!record.data.paperclipProjectId || record.data.paperclipProjectId === target.projectId);
     case 'issue':
       return Boolean(target.issueId && record.paperclipIssueId === target.issueId)
-        && (!record.data.companyId || record.data.companyId === target.companyId);
+        && record.data.companyId === target.companyId;
     default:
       return true;
   }
@@ -11129,14 +11126,17 @@ function doesGitHubIssueLinkRecordMatchTarget(
   }
 
   switch (target.kind) {
+    // Scoped runs only process links saved with their company. A link with no company id would
+    // otherwise be synced by every company's run with that company's token. It still syncs on
+    // unscoped runs; re-save it inside its company to sync it on scoped runs.
     case 'company':
-      return !record.data.companyId || record.data.companyId === target.companyId;
+      return record.data.companyId === target.companyId;
     case 'project':
-      return (!record.data.companyId || record.data.companyId === target.companyId)
+      return record.data.companyId === target.companyId
         && (!record.data.paperclipProjectId || record.data.paperclipProjectId === target.projectId);
     case 'issue':
       return Boolean(target.issueId && record.paperclipIssueId === target.issueId)
-        && (!record.data.companyId || record.data.companyId === target.companyId);
+        && record.data.companyId === target.companyId;
     default:
       return true;
   }
@@ -22438,6 +22438,24 @@ async function performSync(
   }
 }
 
+const OTHER_SYNC_BUSY_MESSAGE =
+  'Another GitHub sync is running in this Paperclip instance. This company sync was not started; try again in a moment.';
+
+async function buildOtherSyncBusyResult(
+  ctx: PluginSetupContext,
+  companyId: string
+): Promise<GitHubSyncSettings> {
+  const persistedSettings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  const scopedSettings = materializeScopedSettings(persistedSettings, null, companyId);
+  return {
+    ...scopedSettings,
+    syncState: {
+      ...scopedSettings.syncState,
+      message: OTHER_SYNC_BUSY_MESSAGE
+    }
+  };
+}
+
 async function startSync(
   ctx: PluginSetupContext,
   trigger: 'manual' | 'schedule' | 'retry',
@@ -22447,6 +22465,19 @@ async function startSync(
     target?: ResolvedSyncTarget;
   } = {}
 ): Promise<GitHubSyncSettings> {
+  const requestedCompanyId = normalizeCompanyId(options.target?.companyId);
+  if (activeSyncPromise && requestedCompanyId && activeRunningSyncCompanyId !== requestedCompanyId) {
+    // The worker runs one sync at a time. Another company's (or an unscoped) run is in progress,
+    // and its result must never be handed to this company. Callers that wait get this company's
+    // own sync once the other run finishes; prompt callers get this company's own state.
+    if (options.awaitCompletion) {
+      await activeSyncPromise.catch(() => undefined);
+      return startSync(ctx, trigger, options);
+    }
+
+    return buildOtherSyncBusyResult(ctx, requestedCompanyId);
+  }
+
   if (activeSyncPromise) {
     if (options.awaitCompletion) {
       return activeSyncPromise;
@@ -22509,7 +22540,6 @@ async function startSync(
       targetCompanyId
     );
     await ctx.state.set(SETTINGS_SCOPE, nextPersistedSettings);
-    await ctx.state.set(SYNC_STATE_SCOPE, currentSettings.syncState);
     currentSettings = materializeScopedSettings(nextPersistedSettings, config, targetCompanyId);
   }
 
@@ -24330,6 +24360,8 @@ export function shouldStartWorkerHost(moduleUrl: string, entry = process.argv[1]
 }
 
 export const __testing = {
+  doesGitHubIssueLinkRecordMatchTarget,
+  doesGitHubPullRequestLinkRecordMatchTarget,
   listIssueInteractionEvents,
   buildDirectPullRequestActionFingerprint,
   buildRemoteActionFingerprint,
@@ -24703,7 +24735,6 @@ const plugin = definePlugin({
       });
 
       await ctx.state.set(SETTINGS_SCOPE, next);
-      await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
       clearGitHubRepositoryTokenCapabilityAudits();
       const scopedGitHubTokenLogin =
         (requestedCompanyId && 'githubTokenLogin' in record ? requestedGitHubTokenLogin : undefined)
@@ -24791,7 +24822,6 @@ const plugin = definePlugin({
       const next = materializeScopedSettings(nextBase, config, companyId);
 
       await ctx.state.set(SETTINGS_SCOPE, next);
-      await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
 
       return {
         ...getPublicSettingsForScope(next, companyId),
@@ -24912,16 +24942,32 @@ const plugin = definePlugin({
         ...(issueId ? { issueId } : {})
       });
 
-      return startSync(ctx, 'manual', {
+      const result = await startSync(ctx, 'manual', {
         awaitCompletion: waitForCompletion,
         ...(typeof paperclipApiBaseUrl === 'string' ? { paperclipApiBaseUrl } : {}),
         ...(target ? { target } : {})
       });
+      // A company-scoped caller only gets its own company's slice of the settings: its mappings and
+      // sync state, never the per-company maps that hold other companies' status and identities.
+      const resultCompanyId = normalizeCompanyId(target?.companyId ?? companyId);
+      return resultCompanyId ? getPublicSettingsForScope(result, resultCompanyId) : result;
     });
 
-    ctx.actions.register('sync.cancel', async () => {
-      const persistedRunningSyncCompanyId =
-        activeRunningSyncState?.syncState.status === 'running'
+    ctx.actions.register('sync.cancel', async (input, actionContext) => {
+      const callerCompanyId = normalizeCompanyId(normalizeActionRecord(input, actionContext).companyId);
+      const liveRunIsActive = activeRunningSyncState?.syncState.status === 'running';
+      if (callerCompanyId && liveRunIsActive && activeRunningSyncCompanyId !== callerCompanyId) {
+        // A company may only cancel its own run. Another company's (or an unscoped) live run is
+        // left alone; the caller gets its own state, with its own orphaned run (if any) finalized.
+        return getPublicSettingsForScope(
+          await reconcileOrphanedRunningSyncState(ctx, callerCompanyId, 'cancelled'),
+          callerCompanyId
+        );
+      }
+
+      const persistedRunningSyncCompanyId = callerCompanyId
+        ? callerCompanyId
+        : liveRunIsActive
           ? activeRunningSyncCompanyId
           : resolvePersistedRunningSyncCompanyId(normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)));
       const currentSettings = await reconcileOrphanedRunningSyncState(
@@ -24930,7 +24976,7 @@ const plugin = definePlugin({
         'cancelled'
       );
       if (currentSettings.syncState.status !== 'running') {
-        return currentSettings;
+        return callerCompanyId ? getPublicSettingsForScope(currentSettings, callerCompanyId) : currentSettings;
       }
 
       const existingRequest =
@@ -24957,7 +25003,7 @@ const plugin = definePlugin({
         persistedRunningSyncCompanyId === null ? undefined : persistedRunningSyncCompanyId
       );
       activeRunningSyncState = next;
-      return next;
+      return callerCompanyId ? getPublicSettingsForScope(next, callerCompanyId) : next;
     });
 
     registerGitHubAgentTools(ctx);
