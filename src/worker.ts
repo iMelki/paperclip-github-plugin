@@ -3938,6 +3938,48 @@ function resolvePaperclipIssueOriginGitHubPullRequestLink(
   };
 }
 
+// Link entities and import-registry entries saved before links carried a company id are only
+// trusted for an issue the caller's company owns. Paperclip scopes ctx.issues.get by company, so a
+// null result (or an error) means the issue belongs to another company and the legacy record is
+// ignored. Records saved with a company id must match the caller's company exactly.
+function createPaperclipIssueOwnershipCheck(
+  ctx: PluginSetupContext,
+  issueId: string,
+  companyId: string,
+  knownIssue?: Issue | null
+): () => Promise<boolean> {
+  let owned: Promise<boolean> | undefined;
+  return () => {
+    owned ??= (async () => {
+      try {
+        const issue = knownIssue !== undefined ? knownIssue : await ctx.issues.get(issueId, companyId);
+        if (!issue) {
+          return false;
+        }
+        const issueCompanyId = normalizeCompanyId((issue as { companyId?: unknown }).companyId);
+        return issueCompanyId === undefined || issueCompanyId === companyId;
+      } catch {
+        return false;
+      }
+    })();
+    return owned;
+  };
+}
+
+async function selectCompanyLinkRecords<T extends { data: { companyId?: string } }>(
+  records: T[],
+  companyId: string,
+  isIssueOwnedByCompany: () => Promise<boolean>
+): Promise<T[]> {
+  const companyRecords = records.filter((record) => record.data.companyId === companyId);
+  const legacyRecords = records.filter((record) => !record.data.companyId);
+  if (legacyRecords.length === 0 || !(await isIssueOwnedByCompany())) {
+    return companyRecords;
+  }
+
+  return records.filter((record) => record.data.companyId === companyId || !record.data.companyId);
+}
+
 async function resolvePaperclipIssueGitHubLink(
   ctx: PluginSetupContext,
   issueId: string,
@@ -3950,7 +3992,10 @@ async function resolvePaperclipIssueGitHubLink(
   const linkRecords = options.linkRecords ?? await listGitHubIssueLinkRecords(ctx, {
     paperclipIssueId: issueId
   });
-  const entityMatch = linkRecords.find((record) => !record.data.companyId || record.data.companyId === companyId);
+  const isIssueOwnedByCompany = createPaperclipIssueOwnershipCheck(ctx, issueId, companyId, options.paperclipIssue ?? undefined);
+  const entityMatch =
+    linkRecords.find((record) => record.data.companyId === companyId)
+    ?? (await selectCompanyLinkRecords(linkRecords, companyId, isIssueOwnedByCompany))[0];
   if (entityMatch) {
     return {
       source: 'entity',
@@ -3967,12 +4012,17 @@ async function resolvePaperclipIssueGitHubLink(
   }
 
   const importRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
-  const registryMatch = importRegistry.find((entry) =>
+  const registryCandidates = importRegistry.filter((entry) =>
     entry.paperclipIssueId === issueId &&
     entry.githubIssueNumber !== undefined &&
     entry.repositoryUrl &&
     (!entry.companyId || entry.companyId === companyId)
   );
+  const registryMatch =
+    registryCandidates.find((entry) => entry.companyId === companyId)
+    ?? (registryCandidates.some((entry) => !entry.companyId) && await isIssueOwnedByCompany()
+      ? registryCandidates.find((entry) => !entry.companyId)
+      : undefined);
   if (registryMatch?.repositoryUrl && registryMatch.githubIssueNumber !== undefined) {
     const githubIssueUrl = buildGitHubIssueUrlFromRepository(
       registryMatch.repositoryUrl,
@@ -3981,7 +4031,8 @@ async function resolvePaperclipIssueGitHubLink(
     if (githubIssueUrl) {
       const fallbackLink = {
         source: 'import_registry',
-        companyId: registryMatch.companyId,
+        // A legacy entry is only used for the caller's own issue, so it belongs to the caller.
+        companyId: registryMatch.companyId ?? companyId,
         paperclipProjectId: registryMatch.paperclipProjectId,
         repositoryUrl: registryMatch.repositoryUrl,
         githubIssueId: registryMatch.githubIssueId,
@@ -4030,8 +4081,7 @@ async function listPaperclipIssueGitHubPullRequestLinks(
     paperclipIssueId: issueId
   });
 
-  return links
-    .filter((record) => !record.data.companyId || record.data.companyId === companyId)
+  return (await selectCompanyLinkRecords(links, companyId, createPaperclipIssueOwnershipCheck(ctx, issueId, companyId)))
     .sort((left, right) => {
       const rightTimestamp = Date.parse(right.updatedAt ?? right.createdAt ?? '');
       const leftTimestamp = Date.parse(left.updatedAt ?? left.createdAt ?? '');
@@ -4625,18 +4675,7 @@ async function buildIssueGitHubDetails(
     };
   }
 
-  const pullRequestLinks = await listGitHubPullRequestLinkRecords(ctx, {
-    paperclipIssueId: issueId
-  });
-  const pullRequestLink = pullRequestLinks
-    .filter((record) => !record.data.companyId || record.data.companyId === companyId)
-    .sort((left, right) => {
-      const rightTimestamp = Date.parse(right.updatedAt ?? right.createdAt ?? '');
-      const leftTimestamp = Date.parse(left.updatedAt ?? left.createdAt ?? '');
-      const safeRightTimestamp = Number.isFinite(rightTimestamp) ? rightTimestamp : 0;
-      const safeLeftTimestamp = Number.isFinite(leftTimestamp) ? leftTimestamp : 0;
-      return safeRightTimestamp - safeLeftTimestamp;
-    })[0];
+  const pullRequestLink = (await listPaperclipIssueGitHubPullRequestLinks(ctx, issueId, companyId))[0];
   if (pullRequestLink) {
     return {
       paperclipIssueId: issueId,
@@ -24409,6 +24448,8 @@ export function shouldStartWorkerHost(moduleUrl: string, entry = process.argv[1]
 }
 
 export const __testing = {
+  resolveGitHubToolRepository,
+  resolveGitHubPullRequestToolTarget,
   doesGitHubIssueLinkRecordMatchTarget,
   doesGitHubPullRequestLinkRecordMatchTarget,
   listIssueInteractionEvents,

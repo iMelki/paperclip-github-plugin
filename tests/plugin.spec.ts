@@ -32509,7 +32509,11 @@ test('company-scoped scheduled run does not start a second sync while the shared
   }
 });
 
-async function startBlockedCompanyASync(options: { recordStateWrites?: string[] } = {}) {
+async function startBlockedCompanyASync(options: {
+  recordStateWrites?: string[];
+  unscoped?: boolean;
+  beforeStart?: (harness: ReturnType<typeof createTestHarness>) => Promise<void>;
+} = {}) {
   const companyA = 'company-busy-a';
   const companyB = 'company-busy-b';
   const workerModule = await importFreshWorkerModule();
@@ -32571,7 +32575,11 @@ async function startBlockedCompanyASync(options: { recordStateWrites?: string[] 
     throw new Error(`Unexpected GitHub request: ${url.toString()}`);
   };
 
-  const companyARun = harness.performAction('sync.runNow', { companyId: companyA, waitForCompletion: true }) as Promise<{
+  await options.beforeStart?.(harness);
+  const companyARun = harness.performAction(
+    'sync.runNow',
+    options.unscoped ? { waitForCompletion: true } : { companyId: companyA, waitForCompletion: true }
+  ) as Promise<{
     syncState: { status?: string; message?: string };
   }>;
   await companyAStarted;
@@ -32768,5 +32776,279 @@ test('two companies waiting on another company sync never run concurrently once 
   } finally {
     releaseFirst();
     globalThis.fetch = originalFetch;
+  }
+});
+
+async function seedLegacyLinkOnCompanyAIssue(options: { registryOnly?: boolean } = {}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-a': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID },
+        'company-b': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  const issueA = await harness.ctx.issues.create({
+    companyId: 'company-a',
+    projectId: 'project-a',
+    title: 'Company A private work',
+    description: 'No GitHub URL in the description.',
+    status: 'todo'
+  });
+  const repositoryUrl = 'https://github.com/secret-org/private-a';
+  if (options.registryOnly) {
+    // Import-registry entry saved before entries carried a company id.
+    await harness.ctx.state.set(
+      { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' },
+      [
+        {
+          mappingId: 'mapping-legacy-a',
+          githubIssueId: 7007,
+          githubIssueNumber: 7,
+          paperclipIssueId: issueA.id,
+          importedAt: '2026-04-01T00:00:00.000Z',
+          repositoryUrl
+        }
+      ]
+    );
+  } else {
+    // Link entities saved before links carried a company id.
+    await harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: issueA.id,
+      externalId: `${repositoryUrl}/issues/7`,
+      data: {
+        paperclipProjectId: 'project-a',
+        repositoryUrl,
+        githubIssueId: 7007,
+        githubIssueNumber: 7,
+        githubIssueUrl: `${repositoryUrl}/issues/7`,
+        githubIssueState: 'open',
+        commentsCount: 3,
+        linkedPullRequestNumbers: [70],
+        linkedPullRequests: [{ number: 70, repositoryUrl }],
+        labels: ['secret-label'],
+        syncedAt: '2026-04-01T00:00:00.000Z'
+      }
+    });
+    await harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        paperclipProjectId: 'project-a',
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-01T00:00:00.000Z'
+      }
+    });
+  }
+  const testing = workerModule.__testing as unknown as {
+    resolveGitHubToolRepository: (ctx: unknown, runCtx: unknown, input: Record<string, unknown>) => Promise<{ url?: string; owner?: string; repo?: string }>;
+    resolveGitHubPullRequestToolTarget: (
+      ctx: unknown,
+      runCtx: unknown,
+      input: Record<string, unknown>
+    ) => Promise<{ repository: { url?: string; owner?: string; repo?: string }; pullRequestNumber: number }>;
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  return {
+    harness,
+    issueA,
+    testing,
+    runCtxFor: (companyId: string) => ({ agentId: `agent-${companyId}`, runId: `run-${companyId}`, companyId, projectId: 'project-x' }),
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('company B issue.githubDetails never returns a legacy link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    const details = await fixture.harness.getData<Record<string, unknown> | null>('issue.githubDetails', {
+      companyId: 'company-b',
+      issueId: fixture.issueA.id
+    });
+    assert.ok(!JSON.stringify(details ?? null).includes('private-a'), `leaked: ${JSON.stringify(details)}`);
+    assert.ok(!JSON.stringify(details ?? null).includes('secret-label'));
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B issue.githubDetails never returns a legacy import-registry entry for a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue({ registryOnly: true });
+  try {
+    const details = await fixture.harness.getData<Record<string, unknown> | null>('issue.githubDetails', {
+      companyId: 'company-b',
+      issueId: fixture.issueA.id
+    });
+    assert.ok(!JSON.stringify(details ?? null).includes('private-a'), `leaked: ${JSON.stringify(details)}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B sync.toolbarState never names a legacy link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    const toolbar = await fixture.harness.getData<Record<string, unknown>>('sync.toolbarState', {
+      companyId: 'company-b',
+      entityType: 'issue',
+      entityId: fixture.issueA.id
+    });
+    assert.ok(!JSON.stringify(toolbar).includes('private-a'), `leaked: ${JSON.stringify(toolbar)}`);
+    assert.ok(!JSON.stringify(toolbar).includes('#7'), `leaked: ${JSON.stringify(toolbar)}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B repository agent tools cannot resolve a legacy link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    await assert.rejects(
+      fixture.testing.resolveGitHubToolRepository(fixture.harness.ctx, fixture.runCtxFor('company-b'), {
+        paperclipIssueId: fixture.issueA.id
+      }),
+      /not linked/i,
+      'resolveGitHubToolRepository must not resolve company A repository for company B'
+    );
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B pull request agent tools cannot resolve a legacy pull request link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    await assert.rejects(
+      fixture.testing.resolveGitHubPullRequestToolTarget(fixture.harness.ctx, fixture.runCtxFor('company-b'), {
+        paperclipIssueId: fixture.issueA.id,
+        pullRequestNumber: 70
+      }),
+      /not linked/i,
+      'resolveGitHubPullRequestToolTarget must not resolve company A pull request for company B'
+    );
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('a legacy link with no company id still works for the issue own company', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    const details = await fixture.harness.getData<{ repositoryUrl?: string; githubIssueNumber?: number; source?: string } | null>(
+      'issue.githubDetails',
+      { companyId: 'company-a', issueId: fixture.issueA.id }
+    );
+    assert.equal(details?.source, 'entity');
+    assert.equal(details?.repositoryUrl, 'https://github.com/secret-org/private-a');
+    assert.equal(details?.githubIssueNumber, 7);
+
+    const toolbar = await fixture.harness.getData<Record<string, unknown>>('sync.toolbarState', {
+      companyId: 'company-a',
+      entityType: 'issue',
+      entityId: fixture.issueA.id
+    });
+    assert.ok(JSON.stringify(toolbar).includes('private-a'), `own company toolbar: ${JSON.stringify(toolbar)}`);
+
+    const repository = await fixture.testing.resolveGitHubToolRepository(fixture.harness.ctx, fixture.runCtxFor('company-a'), {
+      paperclipIssueId: fixture.issueA.id
+    });
+    assert.match(JSON.stringify(repository), /private-a/);
+    const pullRequestTarget = await fixture.testing.resolveGitHubPullRequestToolTarget(
+      fixture.harness.ctx,
+      fixture.runCtxFor('company-a'),
+      { paperclipIssueId: fixture.issueA.id, pullRequestNumber: 70 }
+    );
+    assert.equal(pullRequestTarget.pullRequestNumber, 70);
+    assert.match(JSON.stringify(pullRequestTarget.repository), /private-a/);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B sync.cancel never touches another company run: live run (early return) and orphaned run (caller-scoped target)', async () => {
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  const cancelScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-sync-cancel-request' };
+  type PersistedSettings = { syncState?: Record<string, unknown>; syncStateByCompanyId?: Record<string, Record<string, unknown>> };
+  const seedCompanySyncState = async (
+    harness: ReturnType<typeof createTestHarness>,
+    companyId: string,
+    syncState: Record<string, unknown>
+  ) => {
+    const settings = (harness.getState(settingsScope) ?? {}) as PersistedSettings;
+    await harness.ctx.state.set(settingsScope, {
+      ...settings,
+      syncStateByCompanyId: { ...(settings.syncStateByCompanyId ?? {}), [companyId]: syncState }
+    });
+  };
+  const staleRunningState = {
+    status: 'running',
+    message: 'Stale running state left by an earlier worker.',
+    lastRunTrigger: 'manual',
+    checkedAt: '2026-04-01T00:00:00.000Z'
+  };
+
+  // Part 1 (early return): an unscoped (instance-wide) sync is running live, and its settings carry
+  // a stale running entry for company B. The live state matches every company scope, so without
+  // the early return company B's cancel would see "running", record the instance-wide
+  // cancellation request and cancel a run that is not company B's own.
+  const live = await startBlockedCompanyASync({
+    unscoped: true,
+    beforeStart: (harness) => seedCompanySyncState(harness, 'company-busy-b', staleRunningState)
+  });
+  try {
+    const refused = await live.harness.performAction('sync.cancel', { companyId: live.companyB }) as {
+      syncState: { status?: string; cancelRequestedAt?: string };
+    };
+    assert.equal(refused.syncState.cancelRequestedAt, undefined, 'company B cancel must not mark the live unscoped run as cancelling');
+    assert.equal(live.harness.getState(cancelScope), undefined, 'company B must not request cancellation of the live unscoped run');
+    live.releaseCompanyA();
+    const companyAResult = await live.companyARun;
+    assert.notEqual(companyAResult.syncState.status, 'cancelled', 'the live unscoped run must not be cancelled by company B');
+    assert.ok(!String(companyAResult.syncState.message ?? '').toLowerCase().includes('cancel'), String(companyAResult.syncState.message));
+  } finally {
+    live.releaseCompanyA();
+    await live.companyARun.catch(() => undefined);
+    live.restoreFetch();
+  }
+
+  // Part 2 (caller-scoped target): nothing is running live and company A has an orphaned running
+  // entry. Without scoping the cancel target to the caller, B's cancel would resolve company A as
+  // the persisted running company and finalize company A's run.
+  const orphan = await startBlockedCompanyASync();
+  try {
+    orphan.releaseCompanyA();
+    await orphan.companyARun;
+    await seedCompanySyncState(orphan.harness, orphan.companyA, staleRunningState);
+    const result = await orphan.harness.performAction('sync.cancel', { companyId: orphan.companyB });
+    assert.ok(!JSON.stringify(result).includes('private-a'));
+    const settings = orphan.harness.getState(settingsScope) as PersistedSettings;
+    assert.equal(
+      settings.syncStateByCompanyId?.[orphan.companyA]?.status,
+      'running',
+      'company B cancel must leave company A orphaned run for company A to finalize'
+    );
+    assert.equal(orphan.harness.getState(cancelScope), undefined);
+  } finally {
+    orphan.restoreFetch();
   }
 });
