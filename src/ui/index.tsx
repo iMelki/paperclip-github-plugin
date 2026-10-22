@@ -13,6 +13,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 import { GITHUB_SYNC_PLUGIN_ID } from '../kpi-contract.ts';
+import { GitHubProjectBoardConnection } from './project-board-connection.tsx';
 import { parseRepositoryReference, type ParsedRepositoryReference } from '../github-repo.ts';
 import { resolvePaperclipAuthControlsPolicy } from '../paperclip-health.ts';
 import { normalizeCompanyAssigneeOptionsResponse, type GitHubSyncAssigneeOption } from './assignees.ts';
@@ -12575,6 +12576,8 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
             <h3>Settings</h3>
             <p>{hasCompanyContext ? currentCompanyName : 'Read-only.'}</p>
           </div>
+
+          <GitHubProjectBoardConnection key={hostContext.companyId ?? 'no-company'} />
 
           {showInitialLoadingState ? (
             <div className="ghsync__loading-inline" aria-live="polite">

@@ -1,5 +1,28 @@
 # GitHub Sync plugin specification
 
+## GitHub Projects association, preview and bounded manual import
+
+The candidate settings UI MUST accept personal and organization ProjectV2 URLs,
+reuse an existing company-owned Paperclip destination, and read the board without
+task, assignment, wakeup, job or repository-mapping writes. The board association
+MUST be separate from ordinary sync settings, require a trusted signed-in operator
+to save, and be read back before reporting a successful save. Unknown save outcomes
+MUST expose a load/reconciliation path, not automatic retries. Item enumeration is
+bounded to 1,000 items and 20 pages; supported field values are metadata only.
+Task import MUST remain unavailable until host-level no-dispatch and permanent
+canonical-identity deduplication are qualified. Association persistence is not
+task import or an authenticated installed-runtime connection claim.
+
+Explicit manual import MUST require the native atomic board-import capability,
+a fresh exact-revision plan and a finite operator selection. Task identity MUST
+be company + immutable GitHub issue node; board membership has a separate key.
+Task, held subtree, membership, audit and receipt writes MUST be transactional.
+Generic issue creation or a worker-local dedupe registry MUST NOT be a fallback.
+Stock sync/recovery MUST exclude protected origins, and generic updates from any
+plugin MUST NOT remove their native hold, reparent or assign them. Unknown import
+outcomes MUST retain operation IDs and use read-only reconciliation before retry.
+Connecting authentication MUST NOT create tasks, enable cron or grant agent tools.
+
 GitHub Sync is a Paperclip plugin for registering one or more GitHub repositories and synchronizing their open issues into Paperclip projects.
 
 ## Repository registration
