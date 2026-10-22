@@ -417,6 +417,15 @@ curl -X POST "${PAPERCLIP_API_URL%/}/api/plugins/paperclip-github-plugin/api/com
 
 The worker deduplicates repeated PR events by preferring the pull request URL, then `repository + pullRequestNumber`, before falling back to the explicit `eventKey`. When `paperclipIssueId` is present, the worker verifies the live pull request and persists the same PR-link metadata used by scheduled/manual status syncs.
 
+### Company-scoped scheduled sync
+
+The `sync.github-issues` job is declared with `scope: 'company'`. Paperclip hosts built from `iMelki/paperclip` dev `806dd81e` (paperclip#190) or later run a company-scoped job once per company that has a saved GitHub Sync config, each run with its own run record and `job.companyId`. GitHub Sync then:
+
+- syncs only the repository mappings and third-party links of `job.companyId` in that run, and returns without syncing anything when that company has nothing to sync, instead of falling back to an instance-wide sync that would touch other companies;
+- judges whether the run is due only from that company's own saved sync state, so one company's run on a tick never makes another company look already synced. A company with no saved sync state of its own counts as due.
+
+Older hosts ignore the `scope` key and never pass `job.companyId`, so the job runs once as an instance job and loops over every company, as before. Repository mappings saved without a company id only sync on those instance runs; on a newer host, re-save them inside their company.
+
 ### Paperclip 2026.831 compatibility boundary
 
 GitHub Sync targets Paperclip `2026.831.1` and adopts the host changes that matter for a multi-company connector:
