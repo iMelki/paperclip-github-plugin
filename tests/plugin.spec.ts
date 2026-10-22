@@ -32684,3 +32684,89 @@ test('company-scoped sync targets exclude link records with no company id, unsco
     assert.equal(matches(legacyRecord, undefined), true, 'unscoped runs keep links with no company id');
   }
 });
+
+test('two companies waiting on another company sync never run concurrently once it finishes', async () => {
+  const companies = ['company-queue-a', 'company-queue-b', 'company-queue-c'];
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: Object.fromEntries(
+        companies.map((companyId) => [companyId, { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }])
+      )
+    }
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: companies.map((companyId, index) => ({
+      id: `mapping-queue-${index}`,
+      repositoryUrl: `paperclipai/queue-${index}`,
+      paperclipProjectName: `P${index}`,
+      paperclipProjectId: `project-queue-${index}`,
+      companyId
+    })),
+    syncState: { status: 'idle' }
+  });
+
+  let releaseFirst!: () => void;
+  const firstCanFinish = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    markFirstStarted = resolve;
+  });
+  let inFlightRepositoryListings = 0;
+  let maxInFlightRepositoryListings = 0;
+  const listedRepositories: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    const match = /^\/repos\/paperclipai\/(queue-\d)\/issues$/.exec(url.pathname);
+    if (match) {
+      listedRepositories.push(match[1]);
+      inFlightRepositoryListings += 1;
+      maxInFlightRepositoryListings = Math.max(maxInFlightRepositoryListings, inFlightRepositoryListings);
+      try {
+        if (match[1] === 'queue-0') {
+          markFirstStarted();
+          await firstCanFinish;
+        } else {
+          await delay(30);
+        }
+        return jsonResponse([]);
+      } finally {
+        inFlightRepositoryListings -= 1;
+      }
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const first = harness.performAction('sync.runNow', { companyId: companies[0], waitForCompletion: true });
+    await firstStarted;
+    const waiting = companies.slice(1).map((companyId) =>
+      harness.performAction('sync.runNow', { companyId, waitForCompletion: true }) as Promise<{ syncState: { status?: string; message?: string } }>
+    );
+    await delay(10);
+    releaseFirst();
+    const results = await Promise.all([first, ...waiting]) as Array<{ syncState: { status?: string; message?: string } }>;
+
+    for (const result of results) {
+      assert.equal(result.syncState.status, 'success', result.syncState.message);
+    }
+    assert.deepEqual([...listedRepositories].sort(), ['queue-0', 'queue-1', 'queue-2']);
+    assert.equal(maxInFlightRepositoryListings, 1, 'company syncs must run one at a time');
+  } finally {
+    releaseFirst();
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -721,6 +721,11 @@ function rejectRawCredentialReferenceActionFields(record: Record<string, unknown
 }
 
 let activeSyncPromise: Promise<GitHubSyncSettings> | null = null;
+// Set synchronously when a startSync call passes the busy checks and released once that call has
+// either assigned activeSyncPromise or returned early, so no other caller can slip into the gap
+// between the busy check and the claim (the gap contains awaits).
+let pendingSyncStart: Promise<void> | null = null;
+let releasePendingSyncStart: (() => void) | null = null;
 let activeRunningSyncState: GitHubSyncSettings | null = null;
 let activeRunningSyncCompanyId: string | undefined;
 let activePaperclipApiAuthTokensByCompanyId: Map<string, string> | null = null;
@@ -22465,6 +22470,11 @@ async function startSync(
     target?: ResolvedSyncTarget;
   } = {}
 ): Promise<GitHubSyncSettings> {
+  while (pendingSyncStart && !activeSyncPromise) {
+    // Another call is between its busy check and its claim. Wait to see what it becomes.
+    await pendingSyncStart;
+  }
+
   const requestedCompanyId = normalizeCompanyId(options.target?.companyId);
   if (activeSyncPromise && requestedCompanyId && activeRunningSyncCompanyId !== requestedCompanyId) {
     // The worker runs one sync at a time. Another company's (or an unscoped) run is in progress,
@@ -22491,6 +22501,44 @@ async function startSync(
     return quickResult ?? await getActiveOrCurrentSyncState(ctx);
   }
 
+  const claim = claimSyncStart();
+  try {
+    return await startClaimedSync(ctx, trigger, options);
+  } finally {
+    // Early returns release here. A claim already released when activeSyncPromise was assigned
+    // (and possibly replaced by a later caller's claim) is left alone.
+    if (pendingSyncStart === claim) {
+      releaseSyncStartClaim();
+    }
+  }
+}
+
+function claimSyncStart(): Promise<void> {
+  const claim = new Promise<void>((resolve) => {
+    releasePendingSyncStart = resolve;
+  });
+  pendingSyncStart = claim;
+  return claim;
+}
+
+// Called synchronously right after activeSyncPromise is assigned, while the claim is still this
+// call's own (other callers wait on it instead of claiming), and from the early-return path.
+function releaseSyncStartClaim(): void {
+  const release = releasePendingSyncStart;
+  pendingSyncStart = null;
+  releasePendingSyncStart = null;
+  release?.();
+}
+
+async function startClaimedSync(
+  ctx: PluginSetupContext,
+  trigger: 'manual' | 'schedule' | 'retry',
+  options: {
+    awaitCompletion?: boolean;
+    paperclipApiBaseUrl?: string;
+    target?: ResolvedSyncTarget;
+  }
+): Promise<GitHubSyncSettings> {
   await reconcileOrphanedRunningSyncState(ctx, options.target?.companyId);
 
   const targetCompanyId = normalizeCompanyId(options.target?.companyId);
@@ -22607,6 +22655,7 @@ async function startSync(
       activeSyncPromise = null;
     }
   })();
+  releaseSyncStartClaim();
 
   if (options.awaitCompletion) {
     return activeSyncPromise;
