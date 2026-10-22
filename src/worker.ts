@@ -21291,6 +21291,28 @@ function getJobCompanyId(job: unknown): string | undefined {
   return typeof companyId === 'string' ? normalizeCompanyId(companyId) : undefined;
 }
 
+// A company-scoped run judges its schedule only from that company's own saved sync state. The
+// shared instance-wide syncState is still written for older hosts and the global toolbar, but the
+// scoped read falls back to it, so company B would inherit company A's fresh checkedAt from the
+// same fanned-out tick and be skipped. A company with no saved state of its own counts as due.
+async function isCompanyScheduledSyncDue(
+  ctx: PluginSetupContext,
+  scopedSettings: GitHubSyncSettings,
+  companyId: string,
+  scheduledAt?: string
+): Promise<boolean> {
+  if (getActiveRunningSyncForScope(companyId)) {
+    return false;
+  }
+
+  const persistedSettings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  if (!persistedSettings.syncStateByCompanyId?.[companyId]) {
+    return true;
+  }
+
+  return shouldRunScheduledSync(scopedSettings, scheduledAt);
+}
+
 function selectScheduledSyncTargetsForJobCompany(
   targets: Array<ResolvedSyncTarget | undefined>,
   jobCompanyId: string | undefined
@@ -24929,7 +24951,12 @@ const plugin = definePlugin({
 
       for (const target of scheduledTargets) {
         const scopedSettings = await reconcileOrphanedRunningSyncState(ctx, target?.companyId);
-        if (job.trigger === 'schedule' && !shouldRunScheduledSync(scopedSettings, job.scheduledAt)) {
+        if (
+          job.trigger === 'schedule'
+          && !(jobCompanyId
+            ? await isCompanyScheduledSyncDue(ctx, scopedSettings, jobCompanyId, job.scheduledAt)
+            : shouldRunScheduledSync(scopedSettings, job.scheduledAt))
+        ) {
           continue;
         }
 

@@ -32138,3 +32138,67 @@ test('instance-scoped scheduled sync run without job.companyId still syncs every
     globalThis.fetch = originalFetch;
   }
 });
+
+test('company-scoped scheduled runs for company A then company B on the same tick both sync', async () => {
+  const COMPANY_SCOPE_DENIED_SYNC_MESSAGE =
+    'Paperclip denied GitHub Sync worker access for this company because it has no saved GitHub Sync plugin config. Open GitHub Sync settings inside the company and save settings once so the host registers it.';
+  const companyA = 'company-tick-a';
+  const companyB = 'company-tick-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+  harness.ctx.config.get = async () => {
+    throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-tick-a', repositoryUrl: 'paperclipai/example-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: companyA },
+      { id: 'mapping-tick-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  const readSyncState = (companyId: string) => {
+    const settings = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string; message?: string; lastRunTrigger?: string }> };
+    return settings.syncStateByCompanyId?.[companyId];
+  };
+
+  try {
+    // The host fans out one run per company for the same scheduled tick. Company A's run stamps a
+    // fresh checkedAt, which must not make company B (no saved state of its own yet) look not due.
+    const tick = new Date(Date.now() + 60_000).toISOString();
+    await syncJobHandler({ jobKey: 'sync.github-issues', runId: 'run-tick-a', trigger: 'schedule', scheduledAt: tick, companyId: companyA });
+    await syncJobHandler({ jobKey: 'sync.github-issues', runId: 'run-tick-b', trigger: 'schedule', scheduledAt: tick, companyId: companyB });
+
+    assert.equal(readSyncState(companyA)?.status, 'error');
+    assert.equal(readSyncState(companyA)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+    assert.equal(readSyncState(companyB)?.status, 'error', 'company B must sync on the same tick after company A');
+    assert.equal(readSyncState(companyB)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+    assert.equal(readSyncState(companyB)?.lastRunTrigger, 'schedule');
+
+    // Each company now has its own schedule state, so a second run on the same tick is not due.
+    const companyBCheckedAt = (readSyncState(companyB) as { checkedAt?: string } | undefined)?.checkedAt;
+    await syncJobHandler({ jobKey: 'sync.github-issues', runId: 'run-tick-b-again', trigger: 'schedule', scheduledAt: tick, companyId: companyB });
+    assert.equal((readSyncState(companyB) as { checkedAt?: string } | undefined)?.checkedAt, companyBCheckedAt);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
