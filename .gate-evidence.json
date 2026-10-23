@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "exclude": [],
+  "gates": [
+    {
+      "id": "synthetic-import-contract",
+      "path": "scripts/verify-import-contract-gate.mjs",
+      "description": "Enforces the existing import characterization and proves the outer request ledger rejects swallowed mutation attempts.",
+      "negativeFixture": "tests/bounded-import-contract.spec.ts",
+      "observedFailure": {
+        "date": "2026-10-01",
+        "command": "pnpm test:import-contract",
+        "reason": "The runner sets PAPERCLIP_IMPORT_CONTRACT_NEGATIVE_PROOF=1 only in a child selecting the outer-guard fixture. Its synthetic GraphQL mutation request error is swallowed, but the outer assertion escapes: AssertionError [ERR_ASSERTION]: forbidden GitHub request attempt; child exit 1.",
+        "restoredPass": "A fresh child with the proof toggle removed runs the same selected fixture and exits 0. Dedicated characterization: 3 passed, 0 failed, 0 skipped; proof runner exit 0."
+      }
+    }
+  ]
+}
