@@ -29410,6 +29410,22 @@ test('scheduled job skips while a GitHub rate limit pause is active and resumes 
           rateLimitResource: 'core'
         }
       },
+      // Current releases write the company's own entry as well as the shared slot. A company-scoped
+      // read trusts only its own entry, so the state under test lives there.
+      syncStateByCompanyId: {
+        'company-1': {
+          status: 'error',
+          message: 'REST API rate limit reached while listing GitHub issues for paperclipai/example-repo. Sync paused until 2026-04-09 10:00:00 UTC.',
+          checkedAt: '2026-04-09T09:00:00.000Z',
+          lastRunTrigger: 'schedule',
+          errorDetails: {
+            phase: 'listing_github_issues',
+            repositoryUrl: 'https://github.com/paperclipai/example-repo',
+            rateLimitResetAt: resetAt,
+            rateLimitResource: 'core'
+          }
+        }
+      },
       scheduleFrequencyMinutes: 15,
       updatedAt: '2026-04-09T09:00:00.000Z'
     }
@@ -30467,6 +30483,28 @@ test('settings.registration recovers an orphaned running sync after a worker res
           completedIssueCount: 1,
           totalIssueCount: 3,
           currentIssueNumber: 10
+        }
+      },
+      // Current releases write the company's own entry as well as the shared slot. A company-scoped
+      // read trusts only its own entry, so the state under test lives there.
+      syncStateByCompanyId: {
+        'company-1': {
+          status: 'running',
+          message: 'GitHub sync is running in the background. This page will update when it finishes.',
+          syncedIssuesCount: 3,
+          createdIssuesCount: 1,
+          skippedIssuesCount: 0,
+          erroredIssuesCount: 0,
+          lastRunTrigger: 'manual',
+          progress: {
+            phase: 'syncing',
+            totalRepositoryCount: 1,
+            currentRepositoryIndex: 1,
+            currentRepositoryUrl: 'https://github.com/paperclipai/example-repo',
+            completedIssueCount: 1,
+            totalIssueCount: 3,
+            currentIssueNumber: 10
+          }
         }
       },
       scheduleFrequencyMinutes: 15,
@@ -31974,4 +32012,2418 @@ test('exposing the GitHub token requires a company and a token', async () => {
     exposeGitHubTokenToPaperclipHost(fetchJsonStub, 'company-1', '  '),
     /A GitHub token is required/
   );
+});
+
+test('manifest declares sync.github-issues as a company-scoped job so the host fans out one run per company', () => {
+  const job = manifest.jobs?.find((declaration) => declaration.jobKey === 'sync.github-issues') as
+    | ({ scope?: unknown } & NonNullable<typeof manifest.jobs>[number])
+    | undefined;
+  assert.ok(job, 'sync.github-issues job must be declared');
+  assert.equal(job.scope, 'company');
+});
+
+test('company-scoped scheduled sync run only syncs the mappings of job.companyId', async () => {
+  const COMPANY_SCOPE_DENIED_SYNC_MESSAGE =
+    'Paperclip denied GitHub Sync worker access for this company because it has no saved GitHub Sync plugin config. Open GitHub Sync settings inside the company and save settings once so the host registers it.';
+  const companyA = 'company-scope-a';
+  const companyB = 'company-scope-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+  // Every company sync fails fast at config resolution, so no GitHub traffic is needed and
+  // the per-company sync state shows exactly which companies the run touched.
+  // Count every config read: any sync attempt, scoped or instance-wide, resolves config first.
+  let configReadCount = 0;
+  harness.ctx.config.get = async () => {
+    configReadCount += 1;
+    throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-scope-a',
+        repositoryUrl: 'paperclipai/example-a',
+        paperclipProjectName: 'Engineering A',
+        paperclipProjectId: 'project-a',
+        companyId: companyA
+      },
+      {
+        id: 'mapping-scope-b',
+        repositoryUrl: 'paperclipai/example-b',
+        paperclipProjectName: 'Engineering B',
+        paperclipProjectId: 'project-b',
+        companyId: companyB
+      }
+    ],
+    syncState: {
+      status: 'idle'
+    }
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  const readSyncState = (companyId: string) => {
+    const settings = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string; message?: string; lastRunTrigger?: string }> };
+    return settings.syncStateByCompanyId?.[companyId];
+  };
+
+  try {
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-company-a',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      companyId: companyA
+    });
+
+    assert.equal(readSyncState(companyA)?.status, 'error');
+    assert.equal(readSyncState(companyA)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+    assert.notEqual(readSyncState(companyB)?.status, 'error', 'company B must not be synced by company A run');
+    assert.notEqual(readSyncState(companyB)?.lastRunTrigger, 'schedule');
+
+    const readSharedAndScopedSyncState = () => {
+      const settings = harness.getState({
+        scopeKind: 'instance',
+        stateKey: 'paperclip-github-plugin-settings'
+      }) as { syncState?: unknown; syncStateByCompanyId?: unknown };
+      return JSON.parse(JSON.stringify({ syncState: settings.syncState, syncStateByCompanyId: settings.syncStateByCompanyId }));
+    };
+    const syncStateBeforeRunWithoutMappings = readSharedAndScopedSyncState();
+    const configReadsBeforeRunWithoutMappings = configReadCount;
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-company-other',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      companyId: 'company-without-mappings'
+    });
+    assert.equal(readSyncState('company-without-mappings'), undefined);
+    assert.notEqual(readSyncState(companyB)?.status, 'error', 'a company without mappings must not sync other companies');
+    // Without the early return, the run falls back to the instance-wide sync, which rewrites the
+    // shared syncState. Neither the shared state nor any company's state may change.
+    assert.deepEqual(
+      readSharedAndScopedSyncState(),
+      syncStateBeforeRunWithoutMappings,
+      'a company without mappings must leave the shared and other-company sync state unchanged'
+    );
+    assert.equal(
+      configReadCount,
+      configReadsBeforeRunWithoutMappings,
+      'a company without mappings must not start any sync, including the instance-wide fallback'
+    );
+
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-company-b',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      companyId: companyB
+    });
+    assert.equal(readSyncState(companyB)?.status, 'error');
+    assert.equal(readSyncState(companyB)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('instance-scoped scheduled sync run without job.companyId still syncs every company, as on older hosts', async () => {
+  const companyA = 'company-instance-a';
+  const companyB = 'company-instance-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.config.get = async () => {
+    throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-instance-a', repositoryUrl: 'paperclipai/example-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: companyA },
+      { id: 'mapping-instance-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  try {
+    await harness.runJob('sync.github-issues', { trigger: 'schedule', scheduledAt: new Date(Date.now() + 60 * 60_000).toISOString() });
+    const settings = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string }> };
+    assert.equal(settings.syncStateByCompanyId?.[companyA]?.status, 'error');
+    assert.equal(settings.syncStateByCompanyId?.[companyB]?.status, 'error');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('company-scoped scheduled runs for company A then company B on the same tick both sync', async () => {
+  const COMPANY_SCOPE_DENIED_SYNC_MESSAGE =
+    'Paperclip denied GitHub Sync worker access for this company because it has no saved GitHub Sync plugin config. Open GitHub Sync settings inside the company and save settings once so the host registers it.';
+  const companyA = 'company-tick-a';
+  const companyB = 'company-tick-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+  harness.ctx.config.get = async () => {
+    throw Object.assign(new Error('company context is required'), { name: 'InvocationScopeDeniedError' });
+  };
+
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-tick-a', repositoryUrl: 'paperclipai/example-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: companyA },
+      { id: 'mapping-tick-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  const readSyncState = (companyId: string) => {
+    const settings = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string; message?: string; lastRunTrigger?: string }> };
+    return settings.syncStateByCompanyId?.[companyId];
+  };
+
+  try {
+    // The host fans out one run per company for the same scheduled tick. Company A's run stamps a
+    // fresh checkedAt, which must not make company B (no saved state of its own yet) look not due.
+    const tick = new Date(Date.now() + 60_000).toISOString();
+    await syncJobHandler({ jobKey: 'sync.github-issues', runId: 'run-tick-a', trigger: 'schedule', scheduledAt: tick, companyId: companyA });
+    await syncJobHandler({ jobKey: 'sync.github-issues', runId: 'run-tick-b', trigger: 'schedule', scheduledAt: tick, companyId: companyB });
+
+    assert.equal(readSyncState(companyA)?.status, 'error');
+    assert.equal(readSyncState(companyA)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+    assert.equal(readSyncState(companyB)?.status, 'error', 'company B must sync on the same tick after company A');
+    assert.equal(readSyncState(companyB)?.message, COMPANY_SCOPE_DENIED_SYNC_MESSAGE);
+    assert.equal(readSyncState(companyB)?.lastRunTrigger, 'schedule');
+
+    // Each company now has its own schedule state, so a second run on the same tick is not due.
+    const companyBCheckedAt = (readSyncState(companyB) as { checkedAt?: string } | undefined)?.checkedAt;
+    await syncJobHandler({ jobKey: 'sync.github-issues', runId: 'run-tick-b-again', trigger: 'schedule', scheduledAt: tick, companyId: companyB });
+    assert.equal((readSyncState(companyB) as { checkedAt?: string } | undefined)?.checkedAt, companyBCheckedAt);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+const LEAKED_COMPANY_A_REPOSITORY = 'secret-org/private-a';
+const LEAKED_COMPANY_A_MESSAGE = 'QA-A-MSG company A rate limited on secret-org/private-a';
+
+async function seedSharedSyncStateFromCompanyA(
+  harness: ReturnType<typeof createTestHarness>,
+  companyA: string,
+  companyB: string
+): Promise<void> {
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-leak-a', repositoryUrl: LEAKED_COMPANY_A_REPOSITORY, paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: companyA },
+      { id: 'mapping-leak-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  const current = harness.getState(settingsScope) as Record<string, unknown>;
+  const companyASyncState = {
+    status: 'error',
+    message: LEAKED_COMPANY_A_MESSAGE,
+    checkedAt: new Date().toISOString(),
+    lastRunTrigger: 'schedule',
+    syncedIssuesCount: 0,
+    createdIssuesCount: 0,
+    skippedIssuesCount: 0,
+    erroredIssuesCount: 1,
+    errorDetails: {
+      phase: 'listing_github_issues',
+      repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}`,
+      rawMessage: `API rate limit exceeded for ${LEAKED_COMPANY_A_REPOSITORY}`,
+      rateLimitResetAt: new Date(Date.now() + 6 * 60 * 60_000).toISOString(),
+      rateLimitResource: 'core'
+    }
+  };
+  // Company A's run wrote both the shared slot and its own entry. Company B has no entry yet.
+  await harness.ctx.state.set(settingsScope, {
+    ...current,
+    syncState: companyASyncState,
+    syncStateByCompanyId: { [companyA]: companyASyncState }
+  });
+}
+
+test('company B settings and toolbar data with no saved sync state of its own are idle and leak nothing from company A', async () => {
+  const companyA = 'company-leak-a';
+  const companyB = 'company-leak-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  await seedSharedSyncStateFromCompanyA(harness, companyA, companyB);
+
+  const registration = await harness.getData<{ syncState?: { status?: string; message?: string; errorDetails?: unknown } }>(
+    'settings.registration',
+    { companyId: companyB }
+  );
+  const toolbar = await harness.getData<{ syncState?: { status?: string; message?: string; errorDetails?: unknown } }>(
+    'sync.toolbarState',
+    { companyId: companyB }
+  );
+
+  for (const [label, view] of [['settings.registration', registration], ['sync.toolbarState', toolbar]] as const) {
+    assert.equal(view.syncState?.status, 'idle', `${label} for company B must be idle`);
+    assert.equal(view.syncState?.message, undefined, `${label} for company B must carry no message`);
+    assert.equal(view.syncState?.errorDetails, undefined, `${label} for company B must carry no error details`);
+    const serialized = JSON.stringify(view);
+    assert.ok(!serialized.includes('secret-org'), `${label} for company B must not include company A's repository`);
+    assert.ok(!serialized.includes('QA-A-MSG'), `${label} for company B must not include company A's error`);
+  }
+
+  // Reading company B must not have copied company A's state into company B's own entry.
+  const persisted = harness.getState({
+    scopeKind: 'instance',
+    stateKey: 'paperclip-github-plugin-settings'
+  }) as { syncStateByCompanyId?: Record<string, unknown> };
+  assert.ok(!JSON.stringify(persisted.syncStateByCompanyId?.[companyB] ?? null).includes('QA-A-MSG'));
+});
+
+test('company B scheduled run is not blocked by company A rate-limit backoff in the shared sync state', async () => {
+  const companyA = 'company-backoff-a';
+  const companyB = 'company-backoff-b';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        [companyB]: { type: 'secret_ref', secretId: 'github-secret-ref-backoff-b' }
+      }
+    }
+  });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await seedSharedSyncStateFromCompanyA(harness, companyA, companyB);
+
+  const originalFetch = globalThis.fetch;
+  const githubRequests: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    githubRequests.push(url.pathname);
+    if (url.pathname === '/repos/paperclipai/example-b/issues') {
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-backoff-b',
+      trigger: 'schedule',
+      scheduledAt: new Date(Date.now() + 60_000).toISOString(),
+      companyId: companyB
+    });
+
+    const persisted = harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string; message?: string }> };
+    assert.ok(
+      githubRequests.includes('/repos/paperclipai/example-b/issues'),
+      `company B must reach GitHub despite company A's backoff; requests: ${JSON.stringify(githubRequests)}`
+    );
+    assert.ok(!githubRequests.some((path) => path.includes('secret-org')), 'company B must never request company A repositories');
+    assert.equal(persisted.syncStateByCompanyId?.[companyB]?.status, 'success', persisted.syncStateByCompanyId?.[companyB]?.message);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('unscoped toolbar data without a company id still returns the shared sync state', async () => {
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  await seedSharedSyncStateFromCompanyA(harness, 'company-unscoped-a', 'company-unscoped-b');
+
+  const toolbar = await harness.getData<{ syncState?: { status?: string; message?: string } }>('sync.toolbarState', {});
+  assert.equal(toolbar.syncState?.status, 'error');
+  assert.equal(toolbar.syncState?.message, LEAKED_COMPANY_A_MESSAGE);
+});
+
+test('a company-scoped read ignores shared sync state even when it is the only mapped company and no company has an entry', async () => {
+  const companyId = 'company-only-mapped';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest });
+  await worker.definition.setup(harness.ctx);
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  // Shared-slot-only state, as settings saved before per-company state looked. No exceptions:
+  // the company still reads a fresh idle state.
+  await harness.ctx.state.set(settingsScope, {
+    mappings: [
+      { id: 'mapping-only', repositoryUrl: 'https://github.com/paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId }
+    ],
+    syncState: {
+      status: 'error',
+      message: LEAKED_COMPANY_A_MESSAGE,
+      checkedAt: new Date().toISOString(),
+      lastRunTrigger: 'schedule',
+      errorDetails: {
+        phase: 'listing_github_issues',
+        repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}`,
+        rateLimitResetAt: new Date(Date.now() + 6 * 60 * 60_000).toISOString(),
+        rateLimitResource: 'core'
+      }
+    },
+    scheduleFrequencyMinutes: 15,
+    updatedAt: new Date().toISOString()
+  });
+
+  const toolbar = await harness.getData<{ syncState?: { status?: string; message?: string; errorDetails?: unknown } }>(
+    'sync.toolbarState',
+    { companyId }
+  );
+  assert.equal(toolbar.syncState?.status, 'idle');
+  assert.equal(toolbar.syncState?.message, undefined);
+  assert.equal(toolbar.syncState?.errorDetails, undefined);
+  assert.ok(!JSON.stringify(toolbar).includes('QA-A-MSG'));
+});
+
+test('company-scoped scheduled run does not start a second sync while the shared slot shows a sync running', async () => {
+  const companyId = 'company-1';
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({ manifest, config: testGitHubSecretRefConfig() });
+  type JobHandler = (job: { jobKey: string; runId: string; trigger: string; scheduledAt: string; companyId?: string | null }) => Promise<void>;
+  let syncJobHandler: JobHandler | undefined;
+  const originalRegister = harness.ctx.jobs.register.bind(harness.ctx.jobs);
+  harness.ctx.jobs.register = ((key: string, handler: JobHandler) => {
+    if (key === 'sync.github-issues') {
+      syncJobHandler = handler;
+    }
+    return (originalRegister as (key: string, handler: JobHandler) => unknown)(key, handler);
+  }) as typeof harness.ctx.jobs.register;
+  await worker.definition.setup(harness.ctx);
+  assert.ok(syncJobHandler, 'sync.github-issues handler must be registered');
+
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  // The shared slot says a sync is running and the company has no entry of its own.
+  await harness.ctx.state.set(settingsScope, {
+    mappings: [
+      { id: 'mapping-a', repositoryUrl: 'paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId }
+    ],
+    syncState: {
+      status: 'running',
+      message: 'GitHub sync is running in the background. This page will update when it finishes.',
+      syncedIssuesCount: 2,
+      createdIssuesCount: 1,
+      skippedIssuesCount: 0,
+      erroredIssuesCount: 0,
+      lastRunTrigger: 'schedule',
+      progress: {
+        phase: 'syncing',
+        totalRepositoryCount: 1,
+        currentRepositoryIndex: 1,
+        currentRepositoryUrl: 'https://github.com/paperclipai/example-repo',
+        completedIssueCount: 1,
+        totalIssueCount: 2,
+        currentIssueNumber: 10
+      }
+    },
+    scheduleFrequencyMinutes: 15,
+    updatedAt: '2026-04-09T09:00:00.000Z'
+  });
+
+  const originalFetch = globalThis.fetch;
+  let githubRequestCount = 0;
+  globalThis.fetch = async () => {
+    // Any request means a second sync started.
+    githubRequestCount += 1;
+    return jsonResponse([]);
+  };
+
+  try {
+    await syncJobHandler({
+      jobKey: 'sync.github-issues',
+      runId: 'run-shared-running',
+      trigger: 'schedule',
+      scheduledAt: '2026-04-09T09:45:00.000Z',
+      companyId
+    });
+
+    assert.equal(githubRequestCount, 0, 'no second sync may start while the shared slot shows a sync running');
+    const saved = harness.getState(settingsScope) as {
+      syncState: { status: string; message?: string; lastRunTrigger?: string };
+      syncStateByCompanyId?: Record<string, { status?: string }>;
+    };
+    // This worker has no live run, so the shared running flag is an orphan from a restarted
+    // worker: it is finalized, and the company is not restarted on the same tick.
+    assert.equal(saved.syncState.status, 'error');
+    assert.match(saved.syncState.message ?? '', /worker restarted/i);
+    assert.equal(saved.syncStateByCompanyId?.[companyId]?.status, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+async function startBlockedCompanyASync(options: {
+  recordStateWrites?: string[];
+  unscoped?: boolean;
+  beforeStart?: (harness: ReturnType<typeof createTestHarness>) => Promise<void>;
+} = {}) {
+  const companyA = 'company-busy-a';
+  const companyB = 'company-busy-b';
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        [companyA]: { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID },
+        [companyB]: { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-busy-a', repositoryUrl: 'secret-org/private-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: companyA },
+      { id: 'mapping-busy-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: companyB }
+    ],
+    syncState: { status: 'idle' }
+  });
+  if (options.recordStateWrites) {
+    const writes = options.recordStateWrites;
+    const originalSet = harness.ctx.state.set.bind(harness.ctx.state);
+    harness.ctx.state.set = (async (scope: { stateKey: string }, value: unknown) => {
+      writes.push(scope.stateKey);
+      return (originalSet as (scope: unknown, value: unknown) => Promise<void>)(scope, value);
+    }) as typeof harness.ctx.state.set;
+  }
+
+  let releaseCompanyA!: () => void;
+  const companyACanFinish = new Promise<void>((resolve) => {
+    releaseCompanyA = resolve;
+  });
+  let markCompanyAStarted!: () => void;
+  const companyAStarted = new Promise<void>((resolve) => {
+    markCompanyAStarted = resolve;
+  });
+  const requestedPaths: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    requestedPaths.push(url.pathname);
+    if (url.pathname === '/repos/secret-org/private-a/issues') {
+      markCompanyAStarted();
+      await companyACanFinish;
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/repos/paperclipai/example-b/issues') {
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  await options.beforeStart?.(harness);
+  const companyARun = harness.performAction(
+    'sync.runNow',
+    options.unscoped ? { waitForCompletion: true } : { companyId: companyA, waitForCompletion: true }
+  ) as Promise<{
+    syncState: { status?: string; message?: string };
+  }>;
+  await companyAStarted;
+  return {
+    harness,
+    workerModule,
+    companyA,
+    companyB,
+    companyARun,
+    releaseCompanyA,
+    requestedPaths,
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('company B sync.runNow during company A run gets its own result, never company A result', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const busyResult = await run.harness.performAction('sync.runNow', { companyId: run.companyB, waitForCompletion: false }) as {
+      syncState: { status?: string; message?: string; progress?: unknown };
+    };
+    assert.notEqual(busyResult.syncState.status, 'running', 'company B must not see company A running state');
+    assert.ok(!JSON.stringify(busyResult).includes('private-a'), 'company B busy result must not include company A repository');
+
+    const companyBRun = run.harness.performAction('sync.runNow', { companyId: run.companyB, waitForCompletion: true }) as Promise<{
+      syncState: { status?: string; message?: string };
+    }>;
+    await delay(20);
+    run.releaseCompanyA();
+    const [companyAResult, companyBResult] = await Promise.all([run.companyARun, companyBRun]);
+
+    assert.equal(companyAResult.syncState.status, 'success', companyAResult.syncState.message);
+    assert.equal(companyBResult.syncState.status, 'success', companyBResult.syncState.message);
+    assert.ok(!JSON.stringify(companyBResult).includes('private-a'), 'company B result must not include company A repository');
+    assert.ok(run.requestedPaths.includes('/repos/paperclipai/example-b/issues'), 'company B sync must actually run');
+    const persisted = run.harness.getState({
+      scopeKind: 'instance',
+      stateKey: 'paperclip-github-plugin-settings'
+    }) as { syncStateByCompanyId?: Record<string, { status?: string }> };
+    assert.equal(persisted.syncStateByCompanyId?.[run.companyB]?.status, 'success');
+  } finally {
+    run.releaseCompanyA();
+    run.restoreFetch();
+  }
+});
+
+test('company B sync.cancel cannot cancel company A run, while company A can cancel its own', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const refused = await run.harness.performAction('sync.cancel', { companyId: run.companyB }) as {
+      syncState: { status?: string; message?: string; cancelRequestedAt?: string };
+    };
+    assert.equal(refused.syncState.cancelRequestedAt, undefined);
+    assert.ok(!JSON.stringify(refused).includes('private-a'), 'company B cancel result must not include company A repository');
+    assert.equal(
+      run.harness.getState({ scopeKind: 'instance', stateKey: 'paperclip-github-plugin-sync-cancel-request' }),
+      undefined,
+      'company B must not record a cancellation request for company A run'
+    );
+
+    const cancelled = await run.harness.performAction('sync.cancel', { companyId: run.companyA }) as {
+      syncState: { status?: string; cancelRequestedAt?: string };
+    };
+    assert.equal(typeof cancelled.syncState.cancelRequestedAt, 'string', 'company A can cancel its own run');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('a company-scoped sync never writes the instance-wide last-sync state key', async () => {
+  const writes: string[] = [];
+  const run = await startBlockedCompanyASync({ recordStateWrites: writes });
+  try {
+    run.releaseCompanyA();
+    await run.companyARun;
+    await run.harness.performAction('sync.runNow', { companyId: run.companyB, waitForCompletion: true });
+    assert.ok(writes.length > 0, 'the spy must observe state writes');
+    assert.ok(!writes.includes('paperclip-github-plugin-last-sync'), `unexpected last-sync writes: ${JSON.stringify(writes)}`);
+  } finally {
+    run.restoreFetch();
+  }
+});
+
+test('company-scoped sync targets exclude link records with no company id, unscoped runs keep them', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const { doesGitHubIssueLinkRecordMatchTarget, doesGitHubPullRequestLinkRecordMatchTarget } = workerModule.__testing as unknown as {
+    doesGitHubIssueLinkRecordMatchTarget: (record: unknown, target?: unknown) => boolean;
+    doesGitHubPullRequestLinkRecordMatchTarget: (record: unknown, target?: unknown) => boolean;
+  };
+  assert.equal(typeof doesGitHubIssueLinkRecordMatchTarget, 'function');
+  assert.equal(typeof doesGitHubPullRequestLinkRecordMatchTarget, 'function');
+  const legacyRecord = { paperclipIssueId: 'issue-legacy', data: { paperclipProjectId: 'project-a' } };
+  const ownRecord = { paperclipIssueId: 'issue-own', data: { companyId: 'company-a', paperclipProjectId: 'project-a' } };
+  const otherRecord = { paperclipIssueId: 'issue-other', data: { companyId: 'company-b', paperclipProjectId: 'project-a' } };
+  const targets = [
+    { kind: 'company', companyId: 'company-a', displayLabel: 'company' },
+    { kind: 'project', companyId: 'company-a', projectId: 'project-a', displayLabel: 'project' },
+    { kind: 'issue', companyId: 'company-a', issueId: 'issue-legacy', displayLabel: 'issue' }
+  ];
+  for (const matches of [doesGitHubIssueLinkRecordMatchTarget, doesGitHubPullRequestLinkRecordMatchTarget]) {
+    for (const target of targets) {
+      assert.equal(matches(legacyRecord, target), false, `${target.kind} target must exclude a link with no company id`);
+      assert.equal(matches(otherRecord, target), false, `${target.kind} target must exclude another company's link`);
+    }
+    assert.equal(matches(ownRecord, targets[0]), true);
+    assert.equal(matches(ownRecord, targets[1]), true);
+    assert.equal(matches(legacyRecord, undefined), true, 'unscoped runs keep links with no company id');
+  }
+});
+
+test('two companies waiting on another company sync never run concurrently once it finishes', async () => {
+  const companies = ['company-queue-a', 'company-queue-b', 'company-queue-c'];
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: Object.fromEntries(
+        companies.map((companyId) => [companyId, { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }])
+      )
+    }
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: companies.map((companyId, index) => ({
+      id: `mapping-queue-${index}`,
+      repositoryUrl: `paperclipai/queue-${index}`,
+      paperclipProjectName: `P${index}`,
+      paperclipProjectId: `project-queue-${index}`,
+      companyId
+    })),
+    syncState: { status: 'idle' }
+  });
+
+  let releaseFirst!: () => void;
+  const firstCanFinish = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    markFirstStarted = resolve;
+  });
+  let inFlightRepositoryListings = 0;
+  let maxInFlightRepositoryListings = 0;
+  const listedRepositories: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    const match = /^\/repos\/paperclipai\/(queue-\d)\/issues$/.exec(url.pathname);
+    if (match) {
+      listedRepositories.push(match[1]);
+      inFlightRepositoryListings += 1;
+      maxInFlightRepositoryListings = Math.max(maxInFlightRepositoryListings, inFlightRepositoryListings);
+      try {
+        if (match[1] === 'queue-0') {
+          markFirstStarted();
+          await firstCanFinish;
+        } else {
+          await delay(30);
+        }
+        return jsonResponse([]);
+      } finally {
+        inFlightRepositoryListings -= 1;
+      }
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    const first = harness.performAction('sync.runNow', { companyId: companies[0], waitForCompletion: true });
+    await firstStarted;
+    const waiting = companies.slice(1).map((companyId) =>
+      harness.performAction('sync.runNow', { companyId, waitForCompletion: true }) as Promise<{ syncState: { status?: string; message?: string } }>
+    );
+    await delay(10);
+    releaseFirst();
+    const results = await Promise.all([first, ...waiting]) as Array<{ syncState: { status?: string; message?: string } }>;
+
+    for (const result of results) {
+      assert.equal(result.syncState.status, 'success', result.syncState.message);
+    }
+    assert.deepEqual([...listedRepositories].sort(), ['queue-0', 'queue-1', 'queue-2']);
+    assert.equal(maxInFlightRepositoryListings, 1, 'company syncs must run one at a time');
+  } finally {
+    releaseFirst();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+async function seedLegacyLinkOnCompanyAIssue(options: { registryOnly?: boolean } = {}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-a': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID },
+        'company-b': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  const issueA = await harness.ctx.issues.create({
+    companyId: 'company-a',
+    projectId: 'project-a',
+    title: 'Company A private work',
+    description: 'No GitHub URL in the description.',
+    status: 'todo'
+  });
+  const repositoryUrl = 'https://github.com/secret-org/private-a';
+  if (options.registryOnly) {
+    // Import-registry entry saved before entries carried a company id.
+    await harness.ctx.state.set(
+      { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' },
+      [
+        {
+          mappingId: 'mapping-legacy-a',
+          githubIssueId: 7007,
+          githubIssueNumber: 7,
+          paperclipIssueId: issueA.id,
+          importedAt: '2026-04-01T00:00:00.000Z',
+          repositoryUrl
+        }
+      ]
+    );
+  } else {
+    // Link entities saved before links carried a company id.
+    await harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: issueA.id,
+      externalId: `${repositoryUrl}/issues/7`,
+      data: {
+        paperclipProjectId: 'project-a',
+        repositoryUrl,
+        githubIssueId: 7007,
+        githubIssueNumber: 7,
+        githubIssueUrl: `${repositoryUrl}/issues/7`,
+        githubIssueState: 'open',
+        commentsCount: 3,
+        linkedPullRequestNumbers: [70],
+        linkedPullRequests: [{ number: 70, repositoryUrl }],
+        labels: ['secret-label'],
+        syncedAt: '2026-04-01T00:00:00.000Z'
+      }
+    });
+    await harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        paperclipProjectId: 'project-a',
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-01T00:00:00.000Z'
+      }
+    });
+  }
+  const testing = workerModule.__testing as unknown as {
+    resolveGitHubToolRepository: (ctx: unknown, runCtx: unknown, input: Record<string, unknown>) => Promise<{ url?: string; owner?: string; repo?: string }>;
+    resolveGitHubPullRequestToolTarget: (
+      ctx: unknown,
+      runCtx: unknown,
+      input: Record<string, unknown>
+    ) => Promise<{ repository: { url?: string; owner?: string; repo?: string }; pullRequestNumber: number }>;
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    throw new Error(`Unexpected GitHub request: ${getRequestUrl(input)}`);
+  };
+  return {
+    harness,
+    issueA,
+    testing,
+    runCtxFor: (companyId: string) => ({ agentId: `agent-${companyId}`, runId: `run-${companyId}`, companyId, projectId: 'project-x' }),
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('company B issue.githubDetails never returns a legacy link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    const details = await fixture.harness.getData<Record<string, unknown> | null>('issue.githubDetails', {
+      companyId: 'company-b',
+      issueId: fixture.issueA.id
+    });
+    assert.ok(!JSON.stringify(details ?? null).includes('private-a'), `leaked: ${JSON.stringify(details)}`);
+    assert.ok(!JSON.stringify(details ?? null).includes('secret-label'));
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B issue.githubDetails never returns a legacy import-registry entry for a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue({ registryOnly: true });
+  try {
+    const details = await fixture.harness.getData<Record<string, unknown> | null>('issue.githubDetails', {
+      companyId: 'company-b',
+      issueId: fixture.issueA.id
+    });
+    assert.ok(!JSON.stringify(details ?? null).includes('private-a'), `leaked: ${JSON.stringify(details)}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B sync.toolbarState never names a legacy link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    const toolbar = await fixture.harness.getData<Record<string, unknown>>('sync.toolbarState', {
+      companyId: 'company-b',
+      entityType: 'issue',
+      entityId: fixture.issueA.id
+    });
+    assert.ok(!JSON.stringify(toolbar).includes('private-a'), `leaked: ${JSON.stringify(toolbar)}`);
+    assert.ok(!JSON.stringify(toolbar).includes('#7'), `leaked: ${JSON.stringify(toolbar)}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B repository agent tools cannot resolve a legacy link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    await assert.rejects(
+      fixture.testing.resolveGitHubToolRepository(fixture.harness.ctx, fixture.runCtxFor('company-b'), {
+        paperclipIssueId: fixture.issueA.id
+      }),
+      /not linked/i,
+      'resolveGitHubToolRepository must not resolve company A repository for company B'
+    );
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B pull request agent tools cannot resolve a legacy pull request link on a company A issue', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    await assert.rejects(
+      fixture.testing.resolveGitHubPullRequestToolTarget(fixture.harness.ctx, fixture.runCtxFor('company-b'), {
+        paperclipIssueId: fixture.issueA.id,
+        pullRequestNumber: 70
+      }),
+      /not linked/i,
+      'resolveGitHubPullRequestToolTarget must not resolve company A pull request for company B'
+    );
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('a legacy link with no company id still works for the issue own company', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    const details = await fixture.harness.getData<{ repositoryUrl?: string; githubIssueNumber?: number; source?: string } | null>(
+      'issue.githubDetails',
+      { companyId: 'company-a', issueId: fixture.issueA.id }
+    );
+    assert.equal(details?.source, 'entity');
+    assert.equal(details?.repositoryUrl, 'https://github.com/secret-org/private-a');
+    assert.equal(details?.githubIssueNumber, 7);
+
+    const toolbar = await fixture.harness.getData<Record<string, unknown>>('sync.toolbarState', {
+      companyId: 'company-a',
+      entityType: 'issue',
+      entityId: fixture.issueA.id
+    });
+    assert.ok(JSON.stringify(toolbar).includes('private-a'), `own company toolbar: ${JSON.stringify(toolbar)}`);
+
+    const repository = await fixture.testing.resolveGitHubToolRepository(fixture.harness.ctx, fixture.runCtxFor('company-a'), {
+      paperclipIssueId: fixture.issueA.id
+    });
+    assert.match(JSON.stringify(repository), /private-a/);
+    const pullRequestTarget = await fixture.testing.resolveGitHubPullRequestToolTarget(
+      fixture.harness.ctx,
+      fixture.runCtxFor('company-a'),
+      { paperclipIssueId: fixture.issueA.id, pullRequestNumber: 70 }
+    );
+    assert.equal(pullRequestTarget.pullRequestNumber, 70);
+    assert.match(JSON.stringify(pullRequestTarget.repository), /private-a/);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B sync.cancel never touches another company run: live run (early return) and orphaned run (caller-scoped target)', async () => {
+  const settingsScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+  const cancelScope = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-sync-cancel-request' };
+  type PersistedSettings = { syncState?: Record<string, unknown>; syncStateByCompanyId?: Record<string, Record<string, unknown>> };
+  const seedCompanySyncState = async (
+    harness: ReturnType<typeof createTestHarness>,
+    companyId: string,
+    syncState: Record<string, unknown>
+  ) => {
+    const settings = (harness.getState(settingsScope) ?? {}) as PersistedSettings;
+    await harness.ctx.state.set(settingsScope, {
+      ...settings,
+      syncStateByCompanyId: { ...(settings.syncStateByCompanyId ?? {}), [companyId]: syncState }
+    });
+  };
+  const staleRunningState = {
+    status: 'running',
+    message: 'Stale running state left by an earlier worker.',
+    lastRunTrigger: 'manual',
+    checkedAt: '2026-04-01T00:00:00.000Z'
+  };
+
+  // Part 1 (early return): an unscoped (instance-wide) sync is running live, and its settings carry
+  // a stale running entry for company B. The live state matches every company scope, so without
+  // the early return company B's cancel would see "running", record the instance-wide
+  // cancellation request and cancel a run that is not company B's own.
+  const live = await startBlockedCompanyASync({
+    unscoped: true,
+    beforeStart: (harness) => seedCompanySyncState(harness, 'company-busy-b', staleRunningState)
+  });
+  try {
+    const refused = await live.harness.performAction('sync.cancel', { companyId: live.companyB }) as {
+      syncState: { status?: string; cancelRequestedAt?: string };
+    };
+    assert.equal(refused.syncState.cancelRequestedAt, undefined, 'company B cancel must not mark the live unscoped run as cancelling');
+    assert.equal(live.harness.getState(cancelScope), undefined, 'company B must not request cancellation of the live unscoped run');
+    live.releaseCompanyA();
+    const companyAResult = await live.companyARun;
+    assert.notEqual(companyAResult.syncState.status, 'cancelled', 'the live unscoped run must not be cancelled by company B');
+    assert.ok(!String(companyAResult.syncState.message ?? '').toLowerCase().includes('cancel'), String(companyAResult.syncState.message));
+  } finally {
+    live.releaseCompanyA();
+    await live.companyARun.catch(() => undefined);
+    live.restoreFetch();
+  }
+
+  // Part 2 (caller-scoped target): nothing is running live and company A has an orphaned running
+  // entry. Without scoping the cancel target to the caller, B's cancel would resolve company A as
+  // the persisted running company and finalize company A's run.
+  const orphan = await startBlockedCompanyASync();
+  try {
+    orphan.releaseCompanyA();
+    await orphan.companyARun;
+    await seedCompanySyncState(orphan.harness, orphan.companyA, staleRunningState);
+    const result = await orphan.harness.performAction('sync.cancel', { companyId: orphan.companyB });
+    assert.ok(!JSON.stringify(result).includes('private-a'));
+    const settings = orphan.harness.getState(settingsScope) as PersistedSettings;
+    assert.equal(
+      settings.syncStateByCompanyId?.[orphan.companyA]?.status,
+      'running',
+      'company B cancel must leave company A orphaned run for company A to finalize'
+    );
+    assert.equal(orphan.harness.getState(cancelScope), undefined);
+  } finally {
+    orphan.restoreFetch();
+  }
+});
+
+test('a manual company-scoped sync.runNow skips while that company rate-limit pause is active', async () => {
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({
+    manifest,
+    config: testGitHubSecretRefConfig('company-1')
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: { status: 'idle' }
+  });
+
+  const resetAtMs = Date.now() + 10 * 60_000;
+  const expectedResetAt = new Date(Math.floor(resetAtMs / 1_000) * 1_000).toISOString();
+  const originalFetch = globalThis.fetch;
+  let githubRequestCount = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      githubRequestCount += 1;
+      return githubRateLimitedResponse({ resetAtMs, resource: 'core' });
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  try {
+    type RunNowResult = { syncState: { status: string; message?: string; errorDetails?: { rateLimitResetAt?: string } } };
+    const firstAttempt = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as RunNowResult;
+    assert.equal(firstAttempt.syncState.status, 'error');
+    assert.match(firstAttempt.syncState.message ?? '', /rate limit reached/i);
+    assert.equal(firstAttempt.syncState.errorDetails?.rateLimitResetAt, expectedResetAt);
+    assert.equal(githubRequestCount, 1);
+
+    const secondAttempt = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as RunNowResult;
+    assert.equal(secondAttempt.syncState.status, 'error');
+    assert.equal(secondAttempt.syncState.errorDetails?.rateLimitResetAt, expectedResetAt);
+    assert.equal(githubRequestCount, 1, 'a manual company-scoped retry must not call GitHub during the pause');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+async function setupTwoCompaniesSharingMappingId(options: { entryCompanyId?: string; sameRepository?: boolean } = {}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-a': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID },
+        'company-b': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  const repositoryA = 'https://github.com/paperclipai/a-repo';
+  const repositoryB = options.sameRepository ? repositoryA : 'https://github.com/paperclipai/b-repo';
+  // Both companies saved their first mapping, so both carry the default id mapping-1.
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-settings' },
+    {
+      mappings: [
+        { id: 'mapping-1', repositoryUrl: repositoryA, paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: 'company-a' },
+        { id: 'mapping-1', repositoryUrl: repositoryB, paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: 'company-b' }
+      ],
+      syncState: { status: 'idle' }
+    }
+  );
+  const issueA = await harness.ctx.issues.create({
+    companyId: 'company-a',
+    projectId: 'project-a',
+    title: 'Company A imported issue',
+    description: 'Imported from GitHub.',
+    status: 'todo'
+  });
+  const entryA = {
+    mappingId: 'mapping-1',
+    githubIssueId: 5100,
+    githubIssueNumber: 51,
+    paperclipIssueId: issueA.id,
+    importedAt: '2026-04-10T08:00:00.000Z',
+    lastSeenCommentCount: 0,
+    lastSeenGitHubState: 'open',
+    ...(options.entryCompanyId ? { companyId: options.entryCompanyId } : {})
+  };
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' },
+    [entryA]
+  );
+  const requestedPaths: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    requestedPaths.push(url.pathname);
+    if (url.pathname === '/repos/paperclipai/a-repo/issues' || url.pathname === '/repos/paperclipai/b-repo/issues') {
+      return jsonResponse([]);
+    }
+    const transferred = /^\/repos\/paperclipai\/(a-repo|b-repo)\/issues\/51$/.exec(url.pathname);
+    if (transferred) {
+      // Issue #51 in this repository was transferred to an unmapped repository.
+      return jsonResponse({
+        id: 5100,
+        number: 3,
+        title: 'Transferred unmapped issue',
+        body: 'Moved outside configured sync.',
+        html_url: 'https://github.com/outside/unmapped-repo/issues/3',
+        state: 'open',
+        comments: 0,
+        labels: []
+      });
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+  return {
+    harness,
+    issueA,
+    entryA,
+    testing: workerModule.__testing as unknown as Record<string, (...args: any[]) => any>,
+    requestedPaths,
+    registry: () =>
+      (harness.getState({ scopeKind: 'instance', stateKey: 'paperclip-github-plugin-import-registry' }) ?? []) as Array<Record<string, unknown>>,
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('company B sync never deletes company A legacy registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId();
+  try {
+    await fixture.harness.performAction('sync.runNow', { companyId: 'company-b', waitForCompletion: true });
+    assert.ok(
+      fixture.registry().some((entry) => entry.paperclipIssueId === fixture.issueA.id),
+      `company A registry entry was removed: ${JSON.stringify(fixture.registry())}`
+    );
+    assert.ok(
+      !fixture.requestedPaths.includes('/repos/paperclipai/b-repo/issues/51'),
+      `company B queried its repository for company A entry: ${JSON.stringify(fixture.requestedPaths)}`
+    );
+    assert.equal((await fixture.harness.ctx.issues.get(fixture.issueA.id, 'company-a'))?.status, 'todo');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B sync never pulls in company A registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ entryCompanyId: 'company-a' });
+  try {
+    await fixture.harness.performAction('sync.runNow', { companyId: 'company-b', waitForCompletion: true });
+    assert.ok(
+      !fixture.requestedPaths.includes('/repos/paperclipai/b-repo/issues/51'),
+      `company B queried its repository for company A entry: ${JSON.stringify(fixture.requestedPaths)}`
+    );
+    assert.deepEqual(fixture.registry(), [fixture.entryA]);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('a legacy registry entry with no company id still syncs for the company that owns its issue', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId();
+  try {
+    await fixture.harness.performAction('sync.runNow', { companyId: 'company-a', waitForCompletion: true });
+    assert.ok(
+      fixture.requestedPaths.includes('/repos/paperclipai/a-repo/issues/51'),
+      `company A must still evaluate its own legacy entry: ${JSON.stringify(fixture.requestedPaths)}`
+    );
+    assert.ok(
+      !fixture.registry().some((entry) => entry.paperclipIssueId === fixture.issueA.id),
+      'company A own legacy entry is cleaned up after its issue moved to an unmapped repository'
+    );
+    assert.equal((await fixture.harness.ctx.issues.get(fixture.issueA.id, 'company-a'))?.status, 'cancelled');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B synced issue total never counts company A legacy registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId();
+  try {
+    const companyB = await fixture.harness.getData<{ totalSyncedIssuesCount?: number }>('settings.registration', { companyId: 'company-b' });
+    assert.equal(companyB.totalSyncedIssuesCount, 0);
+    const companyA = await fixture.harness.getData<{ totalSyncedIssuesCount?: number }>('settings.registration', { companyId: 'company-a' });
+    assert.equal(companyA.totalSyncedIssuesCount, 1, 'company A still counts its own legacy entry');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B importing the same GitHub issue never overwrites company A registry entry that shares mapping-1', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ entryCompanyId: 'company-a', sameRepository: true });
+  try {
+    const registry = [{ ...fixture.entryA, repositoryUrl: 'https://github.com/paperclipai/a-repo', paperclipProjectId: 'project-a' }];
+    fixture.testing.upsertImportedIssueRecord(registry, {
+      mappingId: 'mapping-1',
+      githubIssueId: 5100,
+      githubIssueNumber: 51,
+      paperclipIssueId: 'company-b-issue',
+      importedAt: '2026-04-11T08:00:00.000Z',
+      repositoryUrl: 'https://github.com/paperclipai/a-repo',
+      paperclipProjectId: 'project-b',
+      companyId: 'company-b'
+    });
+    assert.equal(registry.length, 2, `company A entry was overwritten: ${JSON.stringify(registry)}`);
+    assert.equal(registry[0]?.paperclipIssueId, fixture.issueA.id);
+    assert.equal(registry[0]?.companyId, 'company-a');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B never adopts company A legacy issue link as an existing import for a shared repository', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: 'https://github.com/paperclipai/a-repo/issues/51',
+      data: {
+        repositoryUrl: 'https://github.com/paperclipai/a-repo',
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: 'https://github.com/paperclipai/a-repo/issues/51',
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const mappingFor = (companyId: string, projectId: string) => ({
+      id: 'mapping-1',
+      repositoryUrl: 'https://github.com/paperclipai/a-repo',
+      paperclipProjectName: projectId,
+      paperclipProjectId: projectId,
+      companyId
+    });
+    const companyB = await fixture.testing.listImportedPaperclipIssuesForMapping(fixture.harness.ctx, mappingFor('company-b', 'project-b')) as Map<string, { id: string }>;
+    assert.ok(
+      ![...companyB.values()].some((entry) => entry.id === fixture.issueA.id),
+      `company B adopted company A issue: ${JSON.stringify([...companyB.entries()])}`
+    );
+    const companyA = await fixture.testing.listImportedPaperclipIssuesForMapping(fixture.harness.ctx, mappingFor('company-a', 'project-a')) as Map<string, { id: string }>;
+    assert.equal(companyA.get('https://github.com/paperclipai/a-repo/issues/51')?.id, fixture.issueA.id, 'company A keeps its own legacy link');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('company B project pull request lookup never names company A issue from a legacy link', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    const repositoryUrl = 'https://github.com/paperclipai/a-repo';
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/issues/51`,
+      data: {
+        repositoryUrl,
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: `${repositoryUrl}/issues/51`,
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const lookupFor = async (companyId: string, projectId: string) => {
+      const lookup = await fixture.testing.buildProjectPullRequestIssueLookup(fixture.harness.ctx, {
+        companyId,
+        projectId,
+        repository: { owner: 'paperclipai', repo: 'a-repo', url: repositoryUrl },
+        mappingCount: 1
+      }) as {
+        linkedIssuesByGitHubIssueUrl: Map<string, { paperclipIssueId: string }>;
+        fallbackIssuesByPullRequestNumber: Map<number, { paperclipIssueId: string }>;
+      };
+      return JSON.stringify([
+        [...lookup.linkedIssuesByGitHubIssueUrl.entries()],
+        [...lookup.fallbackIssuesByPullRequestNumber.entries()]
+      ]);
+    };
+    const companyB = await lookupFor('company-b', 'project-b');
+    assert.ok(!companyB.includes(fixture.issueA.id), `company B lookup names company A issue: ${companyB}`);
+    const companyA = await lookupFor('company-a', 'project-a');
+    assert.ok(companyA.includes(fixture.issueA.id), `company A keeps its own legacy links: ${companyA}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('a project mapping saved without a company id is never resolved for another company project id', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRefs: {
+        'company-a': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID },
+        'company-b': { type: 'secret_ref', secretId: TEST_GITHUB_SECRET_ID }
+      }
+    }
+  });
+  harness.seed({
+    projects: [createProjectFixture({ id: 'project-a', companyId: 'company-a', name: 'A', repoUrl: 'https://github.com/secret-org/private-a' })]
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.ctx.state.set(
+    { scopeKind: 'instance', stateKey: 'paperclip-github-plugin-settings' },
+    {
+      mappings: [
+        { id: 'mapping-1', repositoryUrl: 'https://github.com/secret-org/private-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a' }
+      ],
+      syncState: { status: 'idle' }
+    }
+  );
+  const originalFetch = globalThis.fetch;
+  const requested: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    requested.push(getRequestUrl(input));
+    if (getRequestUrl(input) === 'https://api.github.com/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('GitHubProjectOpenPullRequestCount')) {
+        return graphqlResponse({ repository: { pullRequests: { totalCount: 4 } } });
+      }
+    }
+    throw new Error(`Unexpected fetch: ${getRequestUrl(input)}`);
+  };
+  try {
+    const companyB = await harness.getData<{ status: string }>('project.pullRequests.count', {
+      companyId: 'company-b',
+      projectId: 'project-a'
+    });
+    assert.equal(companyB.status, 'unmapped', `company B resolved company A legacy mapping: ${JSON.stringify(companyB)}`);
+    assert.deepEqual(requested, [], 'company B must not query company A repository');
+    const companyA = await harness.getData<{ status: string; totalOpenPullRequests: number }>('project.pullRequests.count', {
+      companyId: 'company-a',
+      projectId: 'project-a'
+    });
+    assert.equal(companyA.status, 'ready', 'company A still resolves its own legacy mapping');
+    assert.equal(companyA.totalOpenPullRequests, 4);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a company-scoped sync with a per-issue failure returns its error state, not its stale running entry', async () => {
+  const worker = await importFreshWorker();
+  const harness = createTestHarness({
+    manifest,
+    config: testGitHubSecretRefConfig('company-1')
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: { status: 'idle' }
+  });
+  harness.ctx.issues.create = async () => {
+    throw new Error('Simulated import failure');
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse([
+        {
+          id: 5001,
+          number: 50,
+          title: 'Broken import issue',
+          body: 'Broken body',
+          html_url: 'https://github.com/paperclipai/example-repo/issues/50',
+          state: 'open',
+          comments: 0
+        }
+      ]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([{ issueNumber: 50 }]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+  try {
+    const result = await harness.performAction('sync.runNow', {
+      companyId: 'company-1',
+      waitForCompletion: true
+    }) as { syncState: { status: string; erroredIssuesCount?: number; message?: string } };
+    assert.equal(result.syncState.status, 'error', `scoped partial-failure result: ${JSON.stringify(result.syncState)}`);
+    assert.equal(result.syncState.erroredIssuesCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a link with no company id is rejected when the Paperclip issue lookup throws (fail closed)', async () => {
+  const fixture = await seedLegacyLinkOnCompanyAIssue();
+  try {
+    fixture.harness.ctx.issues.get = async () => {
+      throw new Error('Plugin is not available for this company');
+    };
+    // Failing the whole lookup is fine; returning the legacy link is not.
+    const details = await fixture.harness.getData<Record<string, unknown> | null>('issue.githubDetails', {
+      companyId: 'company-a',
+      issueId: fixture.issueA.id
+    }).catch(() => null);
+    assert.ok(!JSON.stringify(details ?? null).includes('private-a'), `accepted on a lookup error: ${JSON.stringify(details)}`);
+    const repository = await fixture.testing.resolveGitHubToolRepository(fixture.harness.ctx, fixture.runCtxFor('company-a'), {
+      paperclipIssueId: fixture.issueA.id
+    }).catch(() => null);
+    assert.equal(repository, null, `resolved on a lookup error: ${JSON.stringify(repository)}`);
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('doesGitHubPullRequestLinkRecordMatchMapping never takes company A legacy pull request link when both companies map the same repository', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    const repositoryUrl = 'https://github.com/paperclipai/a-repo';
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/issues/51`,
+      data: {
+        repositoryUrl,
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: `${repositoryUrl}/issues/51`,
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const mappingFor = (companyId: string, projectId: string) => ({
+      id: 'mapping-1',
+      repositoryUrl,
+      paperclipProjectName: projectId,
+      paperclipProjectId: projectId,
+      companyId
+    });
+    const pullRequestLinks = async (companyId: string, projectId: string) =>
+      (await fixture.testing.listGitHubPullRequestIssueLinksForMapping(fixture.harness.ctx, mappingFor(companyId, projectId)) as Array<{ paperclipIssueId: string }>)
+        .map((record) => record.paperclipIssueId);
+    const issueIds = async (companyId: string, projectId: string) =>
+      [...(await fixture.testing.listGitHubIssueLinkedPaperclipIssueIdsForMapping(fixture.harness.ctx, mappingFor(companyId, projectId), []) as Set<string>)];
+
+    assert.deepEqual(await pullRequestLinks('company-b', 'project-b'), [], 'pull request links for company B mapping');
+    assert.deepEqual(await pullRequestLinks('company-a', 'project-a'), [fixture.issueA.id], 'company A keeps its own legacy pull request link');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+test('doesGitHubIssueLinkRecordMatchMapping never takes company A legacy issue link when both companies map the same repository', async () => {
+  const fixture = await setupTwoCompaniesSharingMappingId({ sameRepository: true });
+  try {
+    const repositoryUrl = 'https://github.com/paperclipai/a-repo';
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.issue-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/issues/51`,
+      data: {
+        repositoryUrl,
+        githubIssueId: 5100,
+        githubIssueNumber: 51,
+        githubIssueUrl: `${repositoryUrl}/issues/51`,
+        githubIssueState: 'open',
+        commentsCount: 0,
+        linkedPullRequestNumbers: [],
+        labels: [],
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    await fixture.harness.ctx.entities.upsert({
+      entityType: 'paperclip-github-plugin.pull-request-link',
+      scopeKind: 'issue',
+      scopeId: fixture.issueA.id,
+      externalId: `${repositoryUrl}/pull/70`,
+      title: 'GitHub pull request #70',
+      status: 'open',
+      data: {
+        repositoryUrl,
+        githubPullRequestNumber: 70,
+        githubPullRequestUrl: `${repositoryUrl}/pull/70`,
+        githubPullRequestState: 'open',
+        title: 'Private A pull request',
+        syncedAt: '2026-04-10T08:00:00.000Z'
+      }
+    });
+    const mappingFor = (companyId: string, projectId: string) => ({
+      id: 'mapping-1',
+      repositoryUrl,
+      paperclipProjectName: projectId,
+      paperclipProjectId: projectId,
+      companyId
+    });
+    const pullRequestLinks = async (companyId: string, projectId: string) =>
+      (await fixture.testing.listGitHubPullRequestIssueLinksForMapping(fixture.harness.ctx, mappingFor(companyId, projectId)) as Array<{ paperclipIssueId: string }>)
+        .map((record) => record.paperclipIssueId);
+    const issueIds = async (companyId: string, projectId: string) =>
+      [...(await fixture.testing.listGitHubIssueLinkedPaperclipIssueIdsForMapping(fixture.harness.ctx, mappingFor(companyId, projectId), []) as Set<string>)];
+
+    assert.deepEqual(await issueIds('company-b', 'project-b'), [], 'issue links for company B mapping');
+    assert.deepEqual(await issueIds('company-a', 'project-a'), [fixture.issueA.id], 'company A keeps its own legacy issue link');
+  } finally {
+    fixture.restoreFetch();
+  }
+});
+
+const CANCEL_SETTINGS_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+const CANCEL_REQUEST_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-sync-cancel-request' };
+
+async function seedCompanyEntry(
+  harness: ReturnType<typeof createTestHarness>,
+  companyId: string,
+  syncState: Record<string, unknown>,
+  shared?: Record<string, unknown>
+): Promise<void> {
+  const settings = (harness.getState(CANCEL_SETTINGS_SCOPE) ?? {}) as {
+    syncStateByCompanyId?: Record<string, unknown>;
+  } & Record<string, unknown>;
+  await harness.ctx.state.set(CANCEL_SETTINGS_SCOPE, {
+    ...settings,
+    ...(shared ? { syncState: shared } : {}),
+    syncStateByCompanyId: { ...(settings.syncStateByCompanyId ?? {}), [companyId]: syncState }
+  });
+}
+
+function spyOnSettingsAndCancelWrites(harness: ReturnType<typeof createTestHarness>): { writes: string[]; stop: () => void } {
+  const writes: string[] = [];
+  const watched = new Set([CANCEL_SETTINGS_SCOPE.stateKey, CANCEL_REQUEST_SCOPE.stateKey]);
+  const originalSet = harness.ctx.state.set;
+  const originalDelete = harness.ctx.state.delete;
+  harness.ctx.state.set = (async (scope: { stateKey: string }, value: unknown) => {
+    if (watched.has(scope.stateKey)) writes.push(`set:${scope.stateKey}`);
+    return (originalSet as (scope: unknown, value: unknown) => Promise<void>).call(harness.ctx.state, scope, value);
+  }) as typeof harness.ctx.state.set;
+  harness.ctx.state.delete = (async (scope: { stateKey: string }) => {
+    if (watched.has(scope.stateKey)) writes.push(`delete:${scope.stateKey}`);
+    return (originalDelete as (scope: unknown) => Promise<void>).call(harness.ctx.state, scope);
+  }) as typeof harness.ctx.state.delete;
+  return {
+    writes,
+    stop: () => {
+      harness.ctx.state.set = originalSet;
+      harness.ctx.state.delete = originalDelete;
+    }
+  };
+}
+
+const OLD_FINISHED_ENTRY = {
+  status: 'success',
+  message: 'Old finished run from yesterday.',
+  checkedAt: '2026-04-01T00:00:00.000Z',
+  lastRunTrigger: 'manual',
+  syncedIssuesCount: 3,
+  createdIssuesCount: 0,
+  skippedIssuesCount: 3,
+  erroredIssuesCount: 0
+};
+const OLD_RUNNING_ENTRY = {
+  status: 'running',
+  message: 'Stale running state left by an earlier worker.',
+  checkedAt: '2026-04-01T00:00:00.000Z',
+  lastRunTrigger: 'manual'
+};
+
+test('(a) a company with an old success entry that starts a run and cancels right away sees running and its cancel takes effect', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({
+    manifest,
+    config: testGitHubSecretRefConfig('company-a')
+  });
+  await worker.definition.setup(harness.ctx);
+  harness.ctx.secrets.resolve = async () => 'github-token';
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-1', repositoryUrl: 'paperclipai/a-repo', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: 'company-a' }
+    ],
+    syncState: { status: 'idle' }
+  });
+  await seedCompanyEntry(harness, 'company-a', OLD_FINISHED_ENTRY);
+
+  // Hold the run right after it wrote its running state to storage and before its first progress
+  // save, which is the window where the in-memory copy still carries the old success entry.
+  let armed = true;
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve;
+  });
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const originalGet = harness.ctx.state.get;
+  harness.ctx.state.get = (async (scope: { stateKey: string }) => {
+    if (armed && scope.stateKey === 'paperclip-github-plugin-import-registry') {
+      armed = false;
+      markHeld();
+      await released;
+    }
+    return (originalGet as (scope: unknown) => Promise<unknown>).call(harness.ctx.state, scope);
+  }) as typeof harness.ctx.state.get;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/a-repo/issues') {
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  const runA = harness.performAction('sync.runNow', { companyId: 'company-a', waitForCompletion: true }) as Promise<{
+    syncState: { status?: string };
+  }>;
+  try {
+    await held;
+    const status = await harness.getData<{ syncState: { status?: string } }>('settings.registration', { companyId: 'company-a' });
+    assert.equal(status.syncState.status, 'running', `status hides the live run: ${JSON.stringify(status.syncState)}`);
+    const toolbar = await harness.getData<{ syncState?: { status?: string } }>('sync.toolbarState', { companyId: 'company-a' });
+    assert.equal(toolbar.syncState?.status, 'running', `toolbar hides the live run: ${JSON.stringify(toolbar)}`);
+
+    const cancelled = await harness.performAction('sync.cancel', { companyId: 'company-a' }) as {
+      syncState: { status?: string; cancelRequestedAt?: string };
+    };
+    assert.equal(typeof cancelled.syncState.cancelRequestedAt, 'string', `cancel was not queued: ${JSON.stringify(cancelled.syncState)}`);
+    assert.ok(harness.getState(CANCEL_REQUEST_SCOPE), 'the cancellation request is recorded');
+    release();
+    const result = await runA;
+    assert.equal(result.syncState.status, 'cancelled', `the cancel did not take effect: ${JSON.stringify(result.syncState)}`);
+  } finally {
+    release();
+    await runA.catch(() => undefined);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('(b) company A pending cancel survives company B old-running orphan cancel, with zero settings or cancel writes', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const companyACancel = await run.harness.performAction('sync.cancel', { companyId: run.companyA }) as {
+      syncState: { cancelRequestedAt?: string };
+    };
+    assert.equal(typeof companyACancel.syncState.cancelRequestedAt, 'string');
+    const pendingRequest = run.harness.getState(CANCEL_REQUEST_SCOPE);
+    assert.ok(pendingRequest, 'company A cancellation request is pending');
+    await seedCompanyEntry(run.harness, run.companyB, OLD_RUNNING_ENTRY);
+
+    const spy = spyOnSettingsAndCancelWrites(run.harness);
+    let companyBView: Record<string, unknown>;
+    try {
+      companyBView = await run.harness.performAction('sync.cancel', { companyId: run.companyB }) as Record<string, unknown>;
+    } finally {
+      spy.stop();
+    }
+    assert.deepEqual(spy.writes, [], 'company B cancel must not write settings or the cancellation request');
+    assert.deepEqual(run.harness.getState(CANCEL_REQUEST_SCOPE), pendingRequest, 'company A pending cancel must survive');
+    const viewJson = JSON.stringify(companyBView);
+    assert.ok(!viewJson.includes('private-a'), `company B view leaks company A: ${viewJson}`);
+    assert.ok(!('syncStateByCompanyId' in companyBView));
+    assert.deepEqual(
+      (companyBView.mappings as Array<{ companyId?: string }>).map((mapping) => mapping.companyId),
+      [run.companyB]
+    );
+    assert.equal((companyBView.syncState as { status?: string }).status, 'running', 'company B sees its own entry, recovered once company A finishes');
+
+    run.releaseCompanyA();
+    const companyAResult = await run.companyARun;
+    assert.equal(companyAResult.syncState.status, 'cancelled', 'company A run honours its pending cancel');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('(c) company B with no state of its own gets idle and no company A details when it cancels during company A run', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const sharedFromCompanyA = {
+      status: 'error',
+      message: LEAKED_COMPANY_A_MESSAGE,
+      checkedAt: new Date().toISOString(),
+      lastRunTrigger: 'schedule',
+      errorDetails: { repositoryUrl: `https://github.com/${LEAKED_COMPANY_A_REPOSITORY}`, rawMessage: LEAKED_COMPANY_A_MESSAGE }
+    };
+    await seedCompanyEntry(run.harness, run.companyA, { ...OLD_FINISHED_ENTRY }, sharedFromCompanyA);
+    const settings = run.harness.getState(CANCEL_SETTINGS_SCOPE) as { syncStateByCompanyId: Record<string, unknown> };
+    delete settings.syncStateByCompanyId[run.companyB];
+    await run.harness.ctx.state.set(CANCEL_SETTINGS_SCOPE, settings);
+
+    const view = await run.harness.performAction('sync.cancel', { companyId: run.companyB }) as {
+      syncState: { status?: string; message?: string; errorDetails?: unknown };
+    };
+    assert.equal(view.syncState.status, 'idle', `company B view: ${JSON.stringify(view.syncState)}`);
+    assert.equal(view.syncState.message, undefined);
+    assert.equal(view.syncState.errorDetails, undefined);
+    assert.ok(!JSON.stringify(view).includes('private-a'), `company B view leaks company A: ${JSON.stringify(view)}`);
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('(d) company B orphan cancel with nothing active still finalizes its own stale running entry', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    run.releaseCompanyA();
+    await run.companyARun;
+    await seedCompanyEntry(run.harness, run.companyB, OLD_RUNNING_ENTRY);
+    const result = await run.harness.performAction('sync.cancel', { companyId: run.companyB }) as {
+      syncState: { status?: string };
+    };
+    assert.equal(result.syncState.status, 'cancelled');
+    const settings = run.harness.getState(CANCEL_SETTINGS_SCOPE) as { syncStateByCompanyId: Record<string, { status?: string }> };
+    assert.equal(settings.syncStateByCompanyId[run.companyB]?.status, 'cancelled');
+    assert.ok(!JSON.stringify(result).includes('private-a'));
+  } finally {
+    run.restoreFetch();
+  }
+});
+
+test('company B status read during company A run never finalizes its orphan or clears company A pending cancel', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('sync.cancel', { companyId: run.companyA });
+    const pendingRequest = run.harness.getState(CANCEL_REQUEST_SCOPE);
+    assert.ok(pendingRequest, 'company A cancellation request is pending');
+    await seedCompanyEntry(run.harness, run.companyB, OLD_RUNNING_ENTRY);
+
+    const spy = spyOnSettingsAndCancelWrites(run.harness);
+    let companyBStatus: { syncState: { status?: string } };
+    try {
+      companyBStatus = await run.harness.getData<{ syncState: { status?: string } }>('settings.registration', { companyId: run.companyB });
+    } finally {
+      spy.stop();
+    }
+    assert.deepEqual(spy.writes, [], 'company B status read must not write settings or the cancellation request');
+    assert.deepEqual(run.harness.getState(CANCEL_REQUEST_SCOPE), pendingRequest, 'company A pending cancel must survive');
+    assert.ok(!JSON.stringify(companyBStatus).includes('private-a'));
+
+    run.releaseCompanyA();
+    assert.equal((await run.companyARun).syncState.status, 'cancelled', 'company A run honours its pending cancel');
+    // With nothing live any more, company B's next read recovers its orphan as before.
+    const recovered = await run.harness.getData<{ syncState: { status?: string } }>('settings.registration', { companyId: run.companyB });
+    assert.notEqual(recovered.syncState.status, 'running');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+const MID_RUN_SETTINGS_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+const MID_RUN_REGISTRY_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-import-registry' };
+const MID_RUN_KPI_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-company-kpis' };
+type MidRunSettings = {
+  mappings: Array<{ repositoryUrl: string; companyId?: string }>;
+  syncState?: { status?: string };
+  syncStateByCompanyId?: Record<string, { status?: string; message?: string }>;
+  scheduleFrequencyMinutesByCompanyId?: Record<string, number>;
+};
+
+async function finishCompanyARun(run: Awaited<ReturnType<typeof startBlockedCompanyASync>>) {
+  run.releaseCompanyA();
+  return run.companyARun;
+}
+
+test('company B mapping and schedule saved during company A run survive company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('settings.saveRegistration', {
+      companyId: run.companyB,
+      mappings: [
+        { id: 'mapping-busy-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: run.companyB },
+        { id: 'mapping-busy-b2', repositoryUrl: 'paperclipai/b-repo-2', paperclipProjectName: 'B2', paperclipProjectId: 'project-b2', companyId: run.companyB }
+      ],
+      scheduleFrequencyMinutes: 99
+    });
+    const midRun = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(midRun.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')), 'company B save landed');
+    assert.equal(midRun.scheduleFrequencyMinutesByCompanyId?.[run.companyB], 99);
+
+    await finishCompanyARun(run);
+    const after = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(
+      after.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')),
+      `company B mapping lost at company A run end: ${JSON.stringify(after.mappings)}`
+    );
+    assert.equal(after.scheduleFrequencyMinutesByCompanyId?.[run.companyB], 99, 'company B schedule lost at company A run end');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B own sync status written during company A run survives company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const current = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings & Record<string, unknown>;
+    await run.harness.ctx.state.set(MID_RUN_SETTINGS_SCOPE, {
+      ...current,
+      syncStateByCompanyId: {
+        ...(current.syncStateByCompanyId ?? {}),
+        [run.companyB]: { status: 'error', message: 'Company B own status written mid-run.', checkedAt: new Date().toISOString() }
+      }
+    });
+    await finishCompanyARun(run);
+    const after = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.equal(after.syncStateByCompanyId?.[run.companyB]?.message, 'Company B own status written mid-run.');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company A own config edit during its run survives its run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('settings.saveRegistration', {
+      companyId: run.companyA,
+      mappings: [
+        { id: 'mapping-busy-a', repositoryUrl: 'secret-org/private-a', paperclipProjectName: 'A', paperclipProjectId: 'project-a', companyId: run.companyA },
+        { id: 'mapping-busy-a2', repositoryUrl: 'secret-org/private-a-2', paperclipProjectName: 'A2', paperclipProjectId: 'project-a2', companyId: run.companyA }
+      ],
+      scheduleFrequencyMinutes: 45
+    });
+    const result = await finishCompanyARun(run);
+    assert.notEqual(result.syncState.status, 'running');
+    const after = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(
+      after.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/private-a-2')),
+      `company A mapping lost at its own run end: ${JSON.stringify(after.mappings)}`
+    );
+    assert.equal(after.scheduleFrequencyMinutesByCompanyId?.[run.companyA], 45);
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company A cancel during its run never wipes company B mid-run settings save', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    await run.harness.performAction('settings.saveRegistration', {
+      companyId: run.companyB,
+      mappings: [
+        { id: 'mapping-busy-b', repositoryUrl: 'paperclipai/example-b', paperclipProjectName: 'B', paperclipProjectId: 'project-b', companyId: run.companyB },
+        { id: 'mapping-busy-b2', repositoryUrl: 'paperclipai/b-repo-2', paperclipProjectName: 'B2', paperclipProjectId: 'project-b2', companyId: run.companyB }
+      ],
+      scheduleFrequencyMinutes: 99
+    });
+    await run.harness.performAction('sync.cancel', { companyId: run.companyA });
+    const afterCancel = run.harness.getState(MID_RUN_SETTINGS_SCOPE) as MidRunSettings;
+    assert.ok(
+      afterCancel.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')),
+      `company A cancel wiped company B mapping: ${JSON.stringify(afterCancel.mappings)}`
+    );
+    assert.equal(afterCancel.scheduleFrequencyMinutesByCompanyId?.[run.companyB], 99, 'company A cancel wiped company B schedule');
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B import-registry link added during company A run survives company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    // The same read, upsert and write the issue link action does (linkPaperclipIssueToGitHubIssue).
+    const testing = run.workerModule.__testing as unknown as {
+      upsertImportedIssueRecord: (registry: unknown[], record: Record<string, unknown>) => unknown;
+    };
+    const registry = (run.harness.getState(MID_RUN_REGISTRY_SCOPE) ?? []) as unknown[];
+    testing.upsertImportedIssueRecord(registry, {
+      mappingId: 'mapping-busy-b',
+      githubIssueId: 9009,
+      githubIssueNumber: 9,
+      paperclipIssueId: 'company-b-linked-issue',
+      importedAt: new Date().toISOString(),
+      repositoryUrl: 'https://github.com/paperclipai/example-b',
+      paperclipProjectId: 'project-b',
+      companyId: run.companyB
+    });
+    await run.harness.ctx.state.set(MID_RUN_REGISTRY_SCOPE, registry);
+
+    await finishCompanyARun(run);
+    const after = (run.harness.getState(MID_RUN_REGISTRY_SCOPE) ?? []) as Array<{ paperclipIssueId?: string }>;
+    assert.ok(
+      after.some((entry) => entry.paperclipIssueId === 'company-b-linked-issue'),
+      `company B link lost at company A run end: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B unlink during company A run stays unlinked after company A run end', async () => {
+  const run = await startBlockedCompanyASync({
+    beforeStart: async (harness) => {
+      const issueB = await harness.ctx.issues.create({
+        companyId: 'company-busy-b',
+        projectId: 'project-b',
+        title: 'Company B linked issue',
+        description: 'Linked to GitHub.',
+        status: 'todo'
+      });
+      await harness.ctx.state.set(MID_RUN_REGISTRY_SCOPE, [
+        {
+          mappingId: 'mapping-busy-b',
+          githubIssueId: 9010,
+          githubIssueNumber: 10,
+          paperclipIssueId: issueB.id,
+          importedAt: '2026-04-01T00:00:00.000Z',
+          repositoryUrl: 'https://github.com/paperclipai/example-b',
+          paperclipProjectId: 'project-b',
+          companyId: 'company-busy-b'
+        }
+      ]);
+    }
+  });
+  try {
+    const registry = run.harness.getState(MID_RUN_REGISTRY_SCOPE) as Array<{ paperclipIssueId: string }>;
+    const issueBId = registry[0]!.paperclipIssueId;
+    await run.harness.performAction('issue.unlinkGitHubItem', { companyId: run.companyB, issueId: issueBId });
+    assert.deepEqual(run.harness.getState(MID_RUN_REGISTRY_SCOPE), [], 'company B unlink removed its registry entry');
+
+    await finishCompanyARun(run);
+    const after = (run.harness.getState(MID_RUN_REGISTRY_SCOPE) ?? []) as Array<{ paperclipIssueId?: string }>;
+    assert.ok(
+      !after.some((entry) => entry.paperclipIssueId === issueBId),
+      `company B unlinked entry came back at company A run end: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('company B KPI event recorded during company A run survives company A run end', async () => {
+  const run = await startBlockedCompanyASync();
+  try {
+    const testing = run.workerModule.__testing as unknown as {
+      persistCompanyActivityMetricEvent: (ctx: unknown, params: Record<string, unknown>) => Promise<{ recorded: boolean }>;
+    };
+    const recorded = await testing.persistCompanyActivityMetricEvent(run.harness.ctx, {
+      companyId: run.companyB,
+      metric: 'githubIssuesClosedCount',
+      eventKey: 'company-b-mid-run-event',
+      repositoryUrl: 'https://github.com/paperclipai/example-b',
+      occurredAt: new Date().toISOString()
+    });
+    assert.equal(recorded.recorded, true);
+    const midRun = JSON.stringify(run.harness.getState(MID_RUN_KPI_SCOPE));
+    assert.ok(midRun.includes('company-b-mid-run-event'), 'company B KPI event landed');
+
+    await finishCompanyARun(run);
+    const after = JSON.stringify(run.harness.getState(MID_RUN_KPI_SCOPE));
+    assert.ok(after.includes('company-b-mid-run-event'), `company B KPI event lost at company A run end: ${after}`);
+  } finally {
+    run.releaseCompanyA();
+    await run.companyARun.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+const BASELINE_REGISTRY_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-import-registry' };
+const BASELINE_SETTINGS_SCOPE = { scopeKind: 'instance' as const, stateKey: 'paperclip-github-plugin-settings' };
+
+function openIssueSnapshotResponse(issueNumber: number) {
+  return graphqlResponse({
+    repository: {
+      issue: {
+        number: issueNumber,
+        state: 'OPEN',
+        stateReason: null,
+        comments: { totalCount: 0 },
+        closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+      }
+    }
+  });
+}
+
+// Company-1 sync of the given GitHub issues, held inside one of its registry saves (before the
+// fresh read) so the test can act between two saves.
+async function startRunHeldOnIssue(options: {
+  issueNumbers: number[];
+  // Hold the run inside its Nth import-registry read, which is the fresh read of a registry save.
+  holdOnRegistryRead: number;
+  beforeStart?: (harness: ReturnType<typeof createTestHarness>) => Promise<void>;
+}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({ manifest, config: { githubTokenRef: 'github-secret-ref' } });
+  await worker.definition.setup(harness.ctx);
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-a', repositoryUrl: 'paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId: 'company-1' }
+    ],
+    syncState: { status: 'idle' }
+  });
+  await options.beforeStart?.(harness);
+
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve;
+  });
+  const originalGet = harness.ctx.state.get.bind(harness.ctx.state) as (scope: unknown) => Promise<unknown>;
+  let registryReads = 0;
+  harness.ctx.state.get = (async (scope: { stateKey: string }) => {
+    if (scope.stateKey === BASELINE_REGISTRY_SCOPE.stateKey) {
+      registryReads += 1;
+      if (registryReads === options.holdOnRegistryRead) {
+        markHeld();
+        await released;
+      }
+    }
+    return originalGet(scope);
+  }) as typeof harness.ctx.state.get;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse(options.issueNumbers.map((number) => ({
+        id: number * 100 + 1,
+        number,
+        title: `Issue ${number}`,
+        body: `Body ${number}`,
+        html_url: `https://github.com/paperclipai/example-repo/issues/${number}`,
+        state: 'open',
+        comments: 0
+      })));
+    }
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse(options.issueNumbers.map((issueNumber) => ({ issueNumber })));
+      }
+      if (query.includes('query GitHubRepositoryOpenIssueLinkedPullRequests')) {
+        return graphqlResponse({
+          repository: {
+            issues: {
+              pageInfo: { hasNextPage: false, endCursor: null },
+              nodes: options.issueNumbers.map((number) => ({
+                number,
+                closedByPullRequestsReferences: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] }
+              }))
+            }
+          }
+        });
+      }
+      if (query.includes('query GitHubIssueStatusSnapshot')) {
+        return openIssueSnapshotResponse(Number(variables.issueNumber));
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  const runResult = harness.performAction('sync.runNow', { companyId: 'company-1', waitForCompletion: true }) as Promise<{
+    syncState: { status?: string; message?: string };
+  }>;
+  const firstOutcome = await Promise.race([held.then(() => 'held'), runResult.then(() => 'finished', () => 'finished')]);
+  return {
+    harness,
+    runResult,
+    held: firstOutcome === 'held',
+    release,
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('(a) an issue the run already saved and that is unlinked mid-run stays unlinked after the run saves again', async () => {
+  const run = await startRunHeldOnIssue({ issueNumbers: [24, 25], holdOnRegistryRead: 3 });
+  try {
+    assert.ok(run.held, 'the run is held inside a registry save');
+    const savedMidRun = (run.harness.getState(BASELINE_REGISTRY_SCOPE) ?? []) as Array<{ githubIssueNumber?: number; paperclipIssueId: string }>;
+    const issue24 = savedMidRun.find((entry) => entry.githubIssueNumber === 24);
+    assert.ok(issue24, `the run saved #24 before #25: ${JSON.stringify(savedMidRun)}`);
+
+    const unlinked = await run.harness.performAction('issue.unlinkGitHubItem', { companyId: 'company-1', issueId: issue24.paperclipIssueId }) as {
+      removedImportRegistryEntriesCount?: number;
+    };
+    assert.equal(unlinked.removedImportRegistryEntriesCount, 1);
+
+    run.release();
+    const result = await run.runResult;
+    assert.equal(result.syncState.status, 'success', result.syncState.message);
+    const after = (run.harness.getState(BASELINE_REGISTRY_SCOPE) ?? []) as Array<{ githubIssueNumber?: number; paperclipIssueId: string }>;
+    assert.ok(after.some((entry) => entry.githubIssueNumber === 25), 'the run saved #25');
+    assert.ok(
+      !after.some((entry) => entry.paperclipIssueId === issue24.paperclipIssueId),
+      `#24 came back after the run saved again: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('(b) a legacy entry the run stamps with its company and that is unlinked before the run saves stays unlinked', async () => {
+  let legacyIssueId = '';
+  const run = await startRunHeldOnIssue({
+    issueNumbers: [24],
+    // Reads: run start, then the run's first save, which writes the entry already stamped with
+    // company-1. Hold before that first save.
+    holdOnRegistryRead: 2,
+    beforeStart: async (harness) => {
+      const issue = await harness.ctx.issues.create({ companyId: 'company-1', projectId: 'project-1', title: 'Issue 24' });
+      legacyIssueId = issue.id;
+      await harness.ctx.state.set(BASELINE_REGISTRY_SCOPE, [
+        {
+          mappingId: 'mapping-a',
+          githubIssueId: 2401,
+          githubIssueNumber: 24,
+          paperclipIssueId: issue.id,
+          importedAt: '2026-04-01T00:00:00.000Z',
+          lastSeenCommentCount: 0,
+          lastSeenGitHubState: 'open'
+        }
+      ]);
+    }
+  });
+  try {
+    assert.ok(run.held, 'the run is held inside a registry save');
+    const unlinked = await run.harness.performAction('issue.unlinkGitHubItem', { companyId: 'company-1', issueId: legacyIssueId }) as {
+      removedImportRegistryEntriesCount?: number;
+    };
+    assert.equal(unlinked.removedImportRegistryEntriesCount, 1);
+    assert.deepEqual(run.harness.getState(BASELINE_REGISTRY_SCOPE), []);
+
+    run.release();
+    const result = await run.runResult;
+    assert.equal(result.syncState.status, 'success', result.syncState.message);
+    const after = (run.harness.getState(BASELINE_REGISTRY_SCOPE) ?? []) as Array<{ paperclipIssueId: string; companyId?: string }>;
+    assert.ok(
+      !after.some((entry) => entry.paperclipIssueId === legacyIssueId),
+      `the stamped legacy entry came back as a new add: ${JSON.stringify(after)}`
+    );
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+// Company-1 manual sync held inside its GitHub token lookup, before it saves the live URL.
+async function startRunHeldInTokenLookup(options: {
+  config: Record<string, unknown>;
+  savedSharedUrl: string;
+  savedCompanyUrl?: string;
+  requestedUrl?: string;
+}) {
+  const workerModule = await importFreshWorkerModule();
+  const worker = workerModule.default as typeof plugin;
+  const harness = createTestHarness({ manifest, config: { githubTokenRef: 'github-secret-ref', ...options.config } });
+  await worker.definition.setup(harness.ctx);
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      { id: 'mapping-a', repositoryUrl: 'paperclipai/example-repo', paperclipProjectName: 'Engineering', paperclipProjectId: 'project-1', companyId: 'company-1' }
+    ],
+    syncState: { status: 'idle' }
+  });
+  await harness.ctx.state.set(BASELINE_SETTINGS_SCOPE, {
+    ...(harness.getState(BASELINE_SETTINGS_SCOPE) as Record<string, unknown>),
+    paperclipApiBaseUrl: options.savedSharedUrl,
+    ...(options.savedCompanyUrl ? { paperclipApiBaseUrlByCompanyId: { 'company-1': options.savedCompanyUrl } } : {})
+  });
+
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let markHeld!: () => void;
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve;
+  });
+  const originalResolve = harness.ctx.secrets.resolve.bind(harness.ctx.secrets);
+  let holdNext = true;
+  harness.ctx.secrets.resolve = (async (...args: Parameters<typeof originalResolve>) => {
+    if (holdNext) {
+      holdNext = false;
+      markHeld();
+      await released;
+    }
+    return originalResolve(...args);
+  }) as typeof harness.ctx.secrets.resolve;
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    if (url.pathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse([]);
+    }
+    if (url.pathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse([]);
+      }
+    }
+    throw new Error(`Unexpected GitHub request: ${url.toString()}`);
+  };
+
+  const runResult = harness.performAction('sync.runNow', {
+    companyId: 'company-1',
+    waitForCompletion: true,
+    paperclipApiBaseUrl: options.requestedUrl ?? options.savedSharedUrl
+  }) as Promise<{ syncState: { status?: string; message?: string } }>;
+  const firstOutcome = await Promise.race([held.then(() => 'held'), runResult.then(() => 'finished', () => 'finished')]);
+  return {
+    harness,
+    runResult,
+    held: firstOutcome === 'held',
+    release,
+    restoreFetch: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('a newer company Paperclip API URL saved while a manual run starts survives the run', async () => {
+  // The run passes the saved shared URL while company-1 has its own URL, so it saves the shared one
+  // for company-1. A newer company-1 URL saved while the run starts must win.
+  const run = await startRunHeldInTokenLookup({
+    config: {},
+    savedSharedUrl: 'http://127.0.0.1:11111',
+    savedCompanyUrl: 'http://127.0.0.1:33333'
+  });
+  try {
+    assert.ok(run.held, 'the run is held in its token lookup');
+    const current = run.harness.getState(BASELINE_SETTINGS_SCOPE) as Record<string, unknown>;
+    await run.harness.ctx.state.set(BASELINE_SETTINGS_SCOPE, {
+      ...current,
+      paperclipApiBaseUrlByCompanyId: { 'company-1': 'http://127.0.0.1:22222' }
+    });
+    run.release();
+    await run.runResult;
+    const after = run.harness.getState(BASELINE_SETTINGS_SCOPE) as { paperclipApiBaseUrlByCompanyId?: Record<string, string> };
+    assert.equal(after.paperclipApiBaseUrlByCompanyId?.['company-1'], 'http://127.0.0.1:22222', 'the newer company URL was overwritten');
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
+});
+
+test('the live Paperclip API URL save keeps another company mapping saved while the run starts', async () => {
+  const run = await startRunHeldInTokenLookup({
+    config: { paperclipApiBaseUrl: 'http://127.0.0.1:63675' },
+    savedSharedUrl: 'http://127.0.0.1:11111',
+    requestedUrl: 'http://127.0.0.1:63675'
+  });
+  try {
+    assert.ok(run.held, 'the run is held in its token lookup');
+    const current = run.harness.getState(BASELINE_SETTINGS_SCOPE) as { mappings: unknown[] } & Record<string, unknown>;
+    await run.harness.ctx.state.set(BASELINE_SETTINGS_SCOPE, {
+      ...current,
+      mappings: [
+        ...current.mappings,
+        { id: 'mapping-b', repositoryUrl: 'https://github.com/paperclipai/b-repo-2', paperclipProjectName: 'B2', paperclipProjectId: 'project-b2', companyId: 'company-2' }
+      ]
+    });
+    run.release();
+    await run.runResult;
+    const after = run.harness.getState(BASELINE_SETTINGS_SCOPE) as {
+      mappings: Array<{ repositoryUrl: string }>;
+      paperclipApiBaseUrlByCompanyId?: Record<string, string>;
+    };
+    assert.equal(after.paperclipApiBaseUrlByCompanyId?.['company-1'], 'http://127.0.0.1:63675', 'the run saved its live URL');
+    assert.ok(
+      after.mappings.some((mapping) => mapping.repositoryUrl.endsWith('/b-repo-2')),
+      `the live URL save dropped another company mapping: ${JSON.stringify(after.mappings)}`
+    );
+  } finally {
+    run.release();
+    await run.runResult.catch(() => undefined);
+    run.restoreFetch();
+  }
 });

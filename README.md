@@ -417,6 +417,25 @@ curl -X POST "${PAPERCLIP_API_URL%/}/api/plugins/paperclip-github-plugin/api/com
 
 The worker deduplicates repeated PR events by preferring the pull request URL, then `repository + pullRequestNumber`, before falling back to the explicit `eventKey`. When `paperclipIssueId` is present, the worker verifies the live pull request and persists the same PR-link metadata used by scheduled/manual status syncs.
 
+### Company-scoped scheduled sync
+
+The `sync.github-issues` job is declared with `scope: 'company'`. Paperclip hosts built from `iMelki/paperclip` dev `806dd81e` (paperclip#190) or later run a company-scoped job once per company that has a saved GitHub Sync config, each run with its own run record and `job.companyId`. GitHub Sync then:
+
+- syncs only the repository mappings and third-party links of `job.companyId` in that run, and returns without syncing anything when that company has nothing to sync, instead of falling back to an instance-wide sync that would touch other companies;
+- judges whether the run is due only from that company's own saved sync state, so one company's run on a tick never makes another company look already synced. A company with no saved sync state of its own counts as due.
+
+Sync status is kept per company everywhere, not only for the schedule. A company that has not synced yet shows an idle state in its settings page and toolbar, with no error text, repository names or rate-limit backoff from another company, and another company's backoff never blocks its runs. Only views with no company context show the shared instance-wide status. There are no exceptions: status saved by older releases only in the shared slot is not shown inside any company, and each company starts idle until its first sync.
+
+Manual sync and cancel are per company as well. The worker runs one sync at a time: when company B asks for a sync while company A's sync is running, B never receives A's result. A waiting request runs B's own sync after A finishes, and a prompt request gets B's own status with a busy message. Company-scoped sync and cancel responses carry only that company's mappings and status. A company can only cancel its own sync; a cancel request with no company keeps the previous instance-wide behavior. A running sync never writes back the settings, import registry, or KPI data it read when it started: right before each save it re-reads the stored value and merges in only its own changes (its own sync status, the registry entries it added, changed, or removed, and its own KPI updates). Mappings, schedules, links, unlinks, and KPI events that any company saves during another company's sync are kept, and a cancel during a run keeps them too. An unlink stays unlinked even when the running sync had already saved that link.
+
+Third-party issue and pull-request links saved without a company id, and repository mappings saved without a company id, are not synced by company-scoped runs, because every company's run would otherwise process them with its own token. They still sync on runs with no company context. On a host from Paperclip dev `806dd81e` or later, re-save these links and mappings inside their company. Lookups for a single issue (the issue's GitHub details, the issue toolbar and the agent tools) still read a link or import record saved without a company id, but only for a company that owns the issue: Paperclip must return the issue for that company, so another company never sees it. Import-registry entries, project mappings and links saved without a company id follow the same rule: mapping ids such as `mapping-1` repeat in every company, so a legacy entry only joins a company's sync, transfer cleanup or synced issue total when that company owns the Paperclip issue, and a legacy project mapping only resolves for the company that owns the project. When two companies map the same repository, a link saved without a company id only joins the mapping of the company that owns its issue.
+
+The worker no longer writes the instance-wide `paperclip-github-plugin-last-sync` state key, which nothing read and which held whichever company synced last.
+
+A scheduled run never starts a second sync while one is still going. If a sync is live in the worker, the run waits for the next tick. If the shared status still says a sync is running but the worker restarted, that interrupted sync is marked as stopped and no company sync starts on that tick.
+
+Older hosts ignore the `scope` key and never pass `job.companyId`, so the job runs once as an instance job and loops over every company, as before. Repository mappings saved without a company id only sync on those instance runs; on a newer host, re-save them inside their company.
+
 ### Paperclip 2026.831 compatibility boundary
 
 GitHub Sync targets Paperclip `2026.831.1` and adopts the host changes that matter for a multi-company connector:
@@ -496,7 +515,7 @@ Example tool payload:
 - If a GitHub-linked project does not show the **Pull requests** sidebar entry on Paperclip `2026.831`, that is expected: the streamlined sidebar has no `projectSidebarItem` mount point, so open `/<company-prefix>/github-pull-requests?projectId=<project id>` directly. On hosts that still render project sidebar items, reopen the plugin settings and re-save the mapping. The project pull request surfaces also recover older mappings when saved ids are missing, and they can fall back to the active project's bound GitHub repository when the project already has a GitHub workspace configured.
 - If GitHub rate limiting is hit, the plugin pauses sync until the reported reset time instead of retrying pointlessly.
 - If a manual sync takes longer than the host action window, it continues in the background and updates the UI when it finishes or when a cancellation request stops it.
-- If a sync shows `running` after the worker has restarted, the next settings read, toolbar read, cancel action, or scheduler tick will reconcile that stale run into an interrupted error or a cancelled result so you can retry cleanly.
+- If a sync shows `running` after the worker has restarted, the next settings read, toolbar read, cancel action, or scheduler tick will reconcile that stale run into an interrupted error or a cancelled result so you can retry cleanly. While another company's sync is running, that recovery waits until the running sync finishes, so it never drops the running sync's pending cancel.
 
 ## Development
 
