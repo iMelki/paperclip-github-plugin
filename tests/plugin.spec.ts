@@ -34426,6 +34426,8 @@ test('the live Paperclip API URL save keeps another company mapping saved while 
     await run.runResult.catch(() => undefined);
     run.restoreFetch();
   }
+});
+
 test('sync stops re-opening a deliberately blocked issue while the PR state is unchanged', async () => {
   const workerModule = await importFreshWorkerModule();
   const { buildExternalPullRequestStateHash, shouldPreserveDeliberateBlockedWait } = workerModule.__testing;
