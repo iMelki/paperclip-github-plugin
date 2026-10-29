@@ -34580,3 +34580,31 @@ test('the unblock budget is only reset by a real transition into blocked', async
     currentExternalStateHash: 'state-b', previousHash: 'state-a'
   }), 'state-a');
 });
+
+test('registry loads keep the recorded unblock hash so a deliberate block is not re-opened', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const { normalizeImportRegistry, normalizeRemoteActionRegistry } = workerModule.__testing;
+  const hash = 'a'.repeat(64);
+  const [imported] = normalizeImportRegistry([
+    {
+      mappingId: 'mapping-a',
+      githubIssueId: 1,
+      paperclipIssueId: 'issue-1',
+      importedAt: '2026-04-01T00:00:00.000Z',
+      unblockedExternalStateHash: hash
+    }
+  ]);
+  assert.equal(imported?.unblockedExternalStateHash, hash);
+  const [action] = normalizeRemoteActionRegistry([{ key: 'action-1', unblockedExternalStateHash: hash }]);
+  assert.equal(action?.unblockedExternalStateHash, hash);
+  const [rejected] = normalizeImportRegistry([
+    {
+      mappingId: 'mapping-a',
+      githubIssueId: 1,
+      paperclipIssueId: 'issue-1',
+      importedAt: '2026-04-01T00:00:00.000Z',
+      unblockedExternalStateHash: 'not-a-hash'
+    }
+  ]);
+  assert.equal(rejected?.unblockedExternalStateHash, undefined);
+});

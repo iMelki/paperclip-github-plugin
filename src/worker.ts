@@ -6783,6 +6783,12 @@ function normalizeSelectedPullRequestGate(value: unknown): GitHubPullRequestRefe
   }
 }
 
+// The "state sync last unblocked on" hash (sha256 hex). Registry loads must keep it, or the
+// deliberate-blocked guard forgets it on the next pass and re-opens the issue.
+function normalizeExternalStateHash(value: unknown): string | undefined {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value) ? value : undefined;
+}
+
 function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
   if (!Array.isArray(value)) {
     return [];
@@ -6830,6 +6836,7 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
       const selectedPullRequestGate = normalizeSelectedPullRequestGate(record.selectedPullRequestGate);
       const pendingRemoteActionWake = normalizePendingRemoteActionWake(record.pendingRemoteActionWake);
       const activationPending = record.activationPending === true;
+      const unblockedExternalStateHash = normalizeExternalStateHash(record.unblockedExternalStateHash);
 
       if (!mappingId || Number.isNaN(githubIssueId) || !paperclipIssueId || !importedAt) {
         return null;
@@ -6850,7 +6857,8 @@ function normalizeImportRegistry(value: unknown): ImportedIssueRecord[] {
         ...(remoteActionFingerprint ? { remoteActionFingerprint } : {}),
         ...(selectedPullRequestGate ? { selectedPullRequestGate } : {}),
         ...(pendingRemoteActionWake ? { pendingRemoteActionWake } : {}),
-        ...(activationPending ? { activationPending: true } : {})
+        ...(activationPending ? { activationPending: true } : {}),
+        ...(unblockedExternalStateHash ? { unblockedExternalStateHash } : {})
       };
     })
     .filter((entry): entry is ImportedIssueRecord => entry !== null);
@@ -6894,6 +6902,7 @@ function normalizeRemoteActionRegistry(value: unknown): RemoteActionRecord[] {
       record.linkedPullRequestCommentCounts
     );
     const selectedPullRequestGate = normalizeSelectedPullRequestGate(record.selectedPullRequestGate);
+    const unblockedExternalStateHash = normalizeExternalStateHash(record.unblockedExternalStateHash);
     const previous = recordsByKey.get(key);
     recordsByKey.set(key, {
       key,
@@ -6908,6 +6917,11 @@ function normalizeRemoteActionRegistry(value: unknown): RemoteActionRecord[] {
         ? { selectedPullRequestGate }
         : previous?.selectedPullRequestGate
           ? { selectedPullRequestGate: previous.selectedPullRequestGate }
+          : {}),
+      ...(unblockedExternalStateHash
+        ? { unblockedExternalStateHash }
+        : previous?.unblockedExternalStateHash
+          ? { unblockedExternalStateHash: previous.unblockedExternalStateHash }
           : {})
     });
   }
