@@ -23291,7 +23291,16 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     await syncAndExpectWake();
     await acknowledgeAndReset();
     checkConclusion = 'FAILURE';
-    await syncAndExpectWake();
+    // The status write that would lift the block fails. The block was not lifted, so the unblock
+    // hash must not be recorded; otherwise the retry would read the block as deliberate and hold it.
+    failNextStatusMutation = true;
+    const failedUnblock = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+    assert.equal(failedUnblock.syncState.status, 'error');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    transitionComments.length = 0;
+    statusMutations.length = 0;
+    wakeRequests.length = 0;
+    await syncAndExpectWake(0);
 
     await acknowledgeAndReset();
     mergeable = 'MERGEABLE';
@@ -34612,4 +34621,139 @@ test('registry loads keep the recorded unblock hash so a deliberate block is not
     }
   ]);
   assert.equal(rejected?.unblockedExternalStateHash, undefined);
+});
+
+test('sync.runNow records the direct PR unblock hash only after the status write lands, so a deliberate re-block holds', async () => {
+  // Pins where the remote-action record gets its unblock hash: a failed status write must not
+  // record it, a landed one must, and a new head commit must resume routing.
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const originalUpdate = harness.ctx.issues.update;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Direct PR deliberate block',
+    description: 'An agent blocks this issue on purpose.'
+  });
+  await upsertDirectPullRequestLink(harness, issue.id, 50, {
+    title: 'Direct PR deliberate block',
+    followThroughAssigneeAgentId: 'engineer-agent'
+  });
+  harness.ctx.agents.get = async (agentId, companyId) => agentId === 'engineer-agent' && companyId === 'company-1'
+    ? { id: agentId, companyId, name: 'Engineer' } as never
+    : null;
+  await originalUpdate(issue.id, { status: 'blocked', assigneeAgentId: 'engineer-agent' } as never, 'company-1');
+
+  let headSha = 'c'.repeat(40);
+  const checkState = 'FAILURE';
+  const statusUpdates: string[] = [];
+  let failNextStatusUpdate = false;
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    if (issueId === issue.id && patch && typeof patch === 'object' && 'status' in patch) {
+      statusUpdates.push(String((patch as { status?: unknown }).status));
+      if (failNextStatusUpdate) {
+        failNextStatusUpdate = false;
+        throw new Error('Injected status update failure.');
+      }
+    }
+    return originalUpdate(issueId, patch, companyId);
+  };
+  const ciContexts = () => ({
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{
+      __typename: 'StatusContext',
+      context: 'ci',
+      state: checkState,
+      createdAt: '2026-04-12T09:00:00Z',
+      updatedAt: '2026-04-12T09:10:00Z'
+    }]
+  });
+  globalThis.fetch = async (input, init) => {
+    const requestUrl = getRequestUrl(input);
+    const requestPathname = getDecodedRequestPathname(input);
+    if (requestPathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse([]);
+    }
+    if (requestPathname === '/repos/paperclipai/example-repo/pulls/50') {
+      return jsonResponse({
+        number: 50,
+        title: 'Direct PR deliberate block',
+        body: 'Open.',
+        html_url: 'https://github.com/paperclipai/example-repo/pull/50',
+        state: 'open',
+        merged: false,
+        head: { sha: headSha }
+      });
+    }
+    if (requestPathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubRepositoryOpenIssueLinkedPullRequests')) {
+        return graphqlResponse({ repository: { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } });
+      }
+      if (query.includes('query GitHubRepositoryOpenPullRequestStatuses')) {
+        return graphqlResponse({ repository: { pullRequests: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [{
+            number: 50, headRefOid: headSha, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null,
+            reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+            statusCheckRollup: { contexts: ciContexts() }
+          }]
+        } } });
+      }
+      if (query.includes('query GitHubPullRequestReviewThreads')) {
+        return graphqlResponse({ repository: { pullRequest: { reviewThreads: {
+          pageInfo: { hasNextPage: false, endCursor: null }, nodes: []
+        } } } });
+      }
+      if (query.includes('query GitHubPullRequestCiContexts')) {
+        return graphqlResponse({ repository: { pullRequest: {
+          headRefOid: headSha, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null,
+          statusCheckRollup: { contexts: ciContexts() }
+        } } });
+      }
+    }
+    throw new Error(`Unexpected fetch during direct PR deliberate block test: ${requestUrl}`);
+  };
+  const runSync = async () => {
+    const result = await harness.performAction('sync.runNow', {
+      companyId: 'company-1', issueId: issue.id, waitForCompletion: true
+    }) as { syncState: { status: string } };
+    assert.equal(result.syncState.status, 'success');
+    return (await harness.ctx.issues.get(issue.id, 'company-1'))?.status;
+  };
+  const readRecord = () => (harness.getState({
+    scopeKind: 'instance', stateKey: 'paperclip-github-plugin-remote-action-registry'
+  }) as Array<Record<string, unknown>> | undefined)?.find((record) => record.key === `direct-pr:company-1:${issue.id}`);
+
+  try {
+    // Pass 0: the status write fails. The block was not lifted, so nothing may record it as lifted.
+    failNextStatusUpdate = true;
+    await harness.performAction('sync.runNow', { companyId: 'company-1', issueId: issue.id, waitForCompletion: true });
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    assert.equal(readRecord()?.unblockedExternalStateHash, undefined);
+    statusUpdates.length = 0;
+    // Pass 1: CI is red, so sync lifts the block and wakes the owner. The unblock hash must be on disk now.
+    const firstStatus = await runSync();
+    assert.notEqual(firstStatus, 'blocked');
+    assert.equal(statusUpdates.length, 1);
+    const firstRecord = readRecord();
+    assert.match(String(firstRecord?.unblockedExternalStateHash ?? ''), /^[a-f0-9]{64}$/);
+    const recordedFields = Object.keys(firstRecord ?? {}).sort();
+
+    // The agent blocks again with GitHub unchanged: the block holds on this and the next pass.
+    await originalUpdate(issue.id, { status: 'blocked' }, 'company-1');
+    statusUpdates.length = 0;
+    assert.equal(await runSync(), 'blocked');
+    assert.equal(await runSync(), 'blocked');
+    assert.equal(statusUpdates.length, 0);
+    assert.deepEqual(Object.keys(readRecord() ?? {}).sort(), recordedFields);
+
+    // A new head commit is new GitHub state, so routing resumes even with the same CI result.
+    headSha = 'd'.repeat(40);
+    assert.notEqual(await runSync(), 'blocked');
+    assert.equal(statusUpdates.length, 1);
+  } finally {
+    harness.ctx.issues.update = originalUpdate;
+    globalThis.fetch = originalFetch;
+  }
 });

@@ -15559,16 +15559,17 @@ async function synchronizePaperclipIssueStatuses(
         currentExternalStateHash,
         previousHash: previousUnblockedExternalStateHash
       });
-      if (nextUnblockedExternalStateHash === undefined) {
-        delete importedIssue.unblockedExternalStateHash;
-      } else {
-        importedIssue.unblockedExternalStateHash = nextUnblockedExternalStateHash;
-      }
-      // Persist at the mutation point. The registry writes further down are conditional, so
-      // relying on them would lose this and the loop would come straight back.
-      if (nextUnblockedExternalStateHash !== previousUnblockedExternalStateHash) {
-        await persistImportRegistry();
-      }
+      // The hash only changes when the status crosses `blocked`, so it is written with the rest of
+      // the observed state in `persistObservedRemoteState`, which runs (and saves) only after the
+      // status write landed. Recording it earlier would mark a block as lifted when the write
+      // failed, and the next pass would then keep the issue blocked for good.
+      const commitUnblockedExternalStateHash = (): void => {
+        if (nextUnblockedExternalStateHash === undefined) {
+          delete importedIssue.unblockedExternalStateHash;
+        } else {
+          importedIssue.unblockedExternalStateHash = nextUnblockedExternalStateHash;
+        }
+      };
 
       const shouldPreserveMaintainerWaitRouting = isHealthyMaintainerWaitTransition({
         currentStatus: paperclipIssue.status,
@@ -15617,6 +15618,7 @@ async function synchronizePaperclipIssueStatuses(
         && (nextAssigneeChanged || paperclipIssue.status !== nextStatus);
 
       const persistObservedRemoteState = async (pendingWake?: PendingRemoteActionWake): Promise<void> => {
+        commitUnblockedExternalStateHash();
         importedIssue.githubIssueNumber = githubIssue.number;
         importedIssue.lastSeenCommentCount = snapshot.commentCount;
         importedIssue.lastSeenGitHubState = snapshot.state;
@@ -16121,17 +16123,16 @@ async function synchronizePaperclipPullRequestIssueStatuses(
         currentExternalStateHash,
         previousHash: previousUnblockedExternalStateHash
       });
-      if (nextUnblockedExternalStateHash === undefined) {
-        delete remoteAction.unblockedExternalStateHash;
-      } else {
-        remoteAction.unblockedExternalStateHash = nextUnblockedExternalStateHash;
-      }
-      // Persist here, and re-resolve the record: `persistRemoteActionRegistry` is followed
-      // elsewhere by a registry re-read, which would otherwise discard this write.
-      if (nextUnblockedExternalStateHash !== previousUnblockedExternalStateHash) {
-        await persistRemoteActionRegistry();
-        remoteAction = remoteActionRegistry.find((record) => record.key === remoteActionKey) ?? remoteAction;
-      }
+      // Written next to the fingerprint after the status write landed, for the same reason as the
+      // imported-issue path: an early write would mark a failed unblock as done. The hash only
+      // changes when the status crosses `blocked`, so the unchanged-status branch never needs it.
+      const commitUnblockedExternalStateHash = (record: RemoteActionRecord): void => {
+        if (nextUnblockedExternalStateHash === undefined) {
+          delete record.unblockedExternalStateHash;
+        } else {
+          record.unblockedExternalStateHash = nextUnblockedExternalStateHash;
+        }
+      };
 
       const shouldPreserveMaintainerWaitRouting = isHealthyMaintainerWaitTransition({
         currentStatus: paperclipIssue.status,
@@ -16281,6 +16282,7 @@ async function synchronizePaperclipPullRequestIssueStatuses(
         actionFingerprint: actionJournalFingerprint,
         paperclipApiBaseUrl
       });
+      commitUnblockedExternalStateHash(remoteAction);
       remoteAction.fingerprint = remoteActionFingerprint;
       remoteAction.linkedPullRequestCommentCounts = currentCommentCounts;
       remoteAction.selectedPullRequestGate = effectiveGate
