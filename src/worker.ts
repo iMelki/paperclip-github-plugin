@@ -55,11 +55,6 @@ const SETTINGS_SCOPE = {
   stateKey: 'paperclip-github-plugin-settings'
 };
 
-const SYNC_STATE_SCOPE = {
-  scopeKind: 'instance' as const,
-  stateKey: 'paperclip-github-plugin-last-sync'
-};
-
 const SYNC_CANCELLATION_SCOPE = {
   scopeKind: 'instance' as const,
   stateKey: 'paperclip-github-plugin-sync-cancel-request'
@@ -726,6 +721,11 @@ function rejectRawCredentialReferenceActionFields(record: Record<string, unknown
 }
 
 let activeSyncPromise: Promise<GitHubSyncSettings> | null = null;
+// Set synchronously when a startSync call passes the busy checks and released once that call has
+// either assigned activeSyncPromise or returned early, so no other caller can slip into the gap
+// between the busy check and the claim (the gap contains awaits).
+let pendingSyncStart: Promise<void> | null = null;
+let releasePendingSyncStart: (() => void) | null = null;
 let activeRunningSyncState: GitHubSyncSettings | null = null;
 let activeRunningSyncCompanyId: string | undefined;
 let activePaperclipApiAuthTokensByCompanyId: Map<string, string> | null = null;
@@ -3803,11 +3803,32 @@ async function resolveProjectScopedMappings(
   }
 
   const candidateMappings = mappings.filter((mapping) => mapping.repositoryUrl.trim());
-  const exactMatches = candidateMappings
-    .filter((mapping) =>
-      mapping.paperclipProjectId === projectId &&
-      (!mapping.companyId || mapping.companyId === companyId)
-    )
+  // A mapping saved without a company id is only trusted for a project the caller's company owns.
+  let callerOwnsProject: Promise<boolean> | undefined;
+  const isProjectOwnedByCaller = () => {
+    callerOwnsProject ??= (async () => {
+      try {
+        const project = await ctx.projects.get(projectId, companyId);
+        if (!project) {
+          return false;
+        }
+        const projectCompanyId = normalizeCompanyId((project as { companyId?: unknown }).companyId);
+        return projectCompanyId === undefined || projectCompanyId === companyId;
+      } catch {
+        return false;
+      }
+    })();
+    return callerOwnsProject;
+  };
+  const projectMatches = candidateMappings.filter((mapping) =>
+    mapping.paperclipProjectId === projectId &&
+    (!mapping.companyId || mapping.companyId === companyId)
+  );
+  const exactMatches = (
+    projectMatches.some((mapping) => !mapping.companyId) && !(await isProjectOwnedByCaller())
+      ? projectMatches.filter((mapping) => mapping.companyId === companyId)
+      : projectMatches
+  )
     .map((mapping) => hydrateResolvedProjectMapping(mapping, {
       companyId,
       projectId
@@ -3938,6 +3959,48 @@ function resolvePaperclipIssueOriginGitHubPullRequestLink(
   };
 }
 
+// Link entities and import-registry entries saved before links carried a company id are only
+// trusted for an issue the caller's company owns. Paperclip scopes ctx.issues.get by company, so a
+// null result (or an error) means the issue belongs to another company and the legacy record is
+// ignored. Records saved with a company id must match the caller's company exactly.
+function createPaperclipIssueOwnershipCheck(
+  ctx: PluginSetupContext,
+  issueId: string,
+  companyId: string,
+  knownIssue?: Issue | null
+): () => Promise<boolean> {
+  let owned: Promise<boolean> | undefined;
+  return () => {
+    owned ??= (async () => {
+      try {
+        const issue = knownIssue !== undefined ? knownIssue : await ctx.issues.get(issueId, companyId);
+        if (!issue) {
+          return false;
+        }
+        const issueCompanyId = normalizeCompanyId((issue as { companyId?: unknown }).companyId);
+        return issueCompanyId === undefined || issueCompanyId === companyId;
+      } catch {
+        return false;
+      }
+    })();
+    return owned;
+  };
+}
+
+async function selectCompanyLinkRecords<T extends { data: { companyId?: string } }>(
+  records: T[],
+  companyId: string,
+  isIssueOwnedByCompany: () => Promise<boolean>
+): Promise<T[]> {
+  const companyRecords = records.filter((record) => record.data.companyId === companyId);
+  const legacyRecords = records.filter((record) => !record.data.companyId);
+  if (legacyRecords.length === 0 || !(await isIssueOwnedByCompany())) {
+    return companyRecords;
+  }
+
+  return records.filter((record) => record.data.companyId === companyId || !record.data.companyId);
+}
+
 async function resolvePaperclipIssueGitHubLink(
   ctx: PluginSetupContext,
   issueId: string,
@@ -3950,7 +4013,10 @@ async function resolvePaperclipIssueGitHubLink(
   const linkRecords = options.linkRecords ?? await listGitHubIssueLinkRecords(ctx, {
     paperclipIssueId: issueId
   });
-  const entityMatch = linkRecords.find((record) => !record.data.companyId || record.data.companyId === companyId);
+  const isIssueOwnedByCompany = createPaperclipIssueOwnershipCheck(ctx, issueId, companyId, options.paperclipIssue ?? undefined);
+  const entityMatch =
+    linkRecords.find((record) => record.data.companyId === companyId)
+    ?? (await selectCompanyLinkRecords(linkRecords, companyId, isIssueOwnedByCompany))[0];
   if (entityMatch) {
     return {
       source: 'entity',
@@ -3967,12 +4033,17 @@ async function resolvePaperclipIssueGitHubLink(
   }
 
   const importRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
-  const registryMatch = importRegistry.find((entry) =>
+  const registryCandidates = importRegistry.filter((entry) =>
     entry.paperclipIssueId === issueId &&
     entry.githubIssueNumber !== undefined &&
     entry.repositoryUrl &&
     (!entry.companyId || entry.companyId === companyId)
   );
+  const registryMatch =
+    registryCandidates.find((entry) => entry.companyId === companyId)
+    ?? (registryCandidates.some((entry) => !entry.companyId) && await isIssueOwnedByCompany()
+      ? registryCandidates.find((entry) => !entry.companyId)
+      : undefined);
   if (registryMatch?.repositoryUrl && registryMatch.githubIssueNumber !== undefined) {
     const githubIssueUrl = buildGitHubIssueUrlFromRepository(
       registryMatch.repositoryUrl,
@@ -3981,7 +4052,8 @@ async function resolvePaperclipIssueGitHubLink(
     if (githubIssueUrl) {
       const fallbackLink = {
         source: 'import_registry',
-        companyId: registryMatch.companyId,
+        // A legacy entry is only used for the caller's own issue, so it belongs to the caller.
+        companyId: registryMatch.companyId ?? companyId,
         paperclipProjectId: registryMatch.paperclipProjectId,
         repositoryUrl: registryMatch.repositoryUrl,
         githubIssueId: registryMatch.githubIssueId,
@@ -4030,8 +4102,7 @@ async function listPaperclipIssueGitHubPullRequestLinks(
     paperclipIssueId: issueId
   });
 
-  return links
-    .filter((record) => !record.data.companyId || record.data.companyId === companyId)
+  return (await selectCompanyLinkRecords(links, companyId, createPaperclipIssueOwnershipCheck(ctx, issueId, companyId)))
     .sort((left, right) => {
       const rightTimestamp = Date.parse(right.updatedAt ?? right.createdAt ?? '');
       const leftTimestamp = Date.parse(left.updatedAt ?? left.createdAt ?? '');
@@ -4625,18 +4696,7 @@ async function buildIssueGitHubDetails(
     };
   }
 
-  const pullRequestLinks = await listGitHubPullRequestLinkRecords(ctx, {
-    paperclipIssueId: issueId
-  });
-  const pullRequestLink = pullRequestLinks
-    .filter((record) => !record.data.companyId || record.data.companyId === companyId)
-    .sort((left, right) => {
-      const rightTimestamp = Date.parse(right.updatedAt ?? right.createdAt ?? '');
-      const leftTimestamp = Date.parse(left.updatedAt ?? left.createdAt ?? '');
-      const safeRightTimestamp = Number.isFinite(rightTimestamp) ? rightTimestamp : 0;
-      const safeLeftTimestamp = Number.isFinite(leftTimestamp) ? leftTimestamp : 0;
-      return safeRightTimestamp - safeLeftTimestamp;
-    })[0];
+  const pullRequestLink = (await listPaperclipIssueGitHubPullRequestLinks(ctx, issueId, companyId))[0];
   if (pullRequestLink) {
     return {
       paperclipIssueId: issueId,
@@ -5208,16 +5268,18 @@ function createSetupConfigurationErrorSyncState(
   }
 }
 
+// Sync-state saves re-read the stored settings right before writing and merge in only this
+// scope's sync state. The caller's copy is never written back, so mappings, schedules and other
+// companies' entries saved by anyone else during a run are kept.
 async function saveSettingsSyncState(
   ctx: PluginSetupContext,
-  settings: GitHubSyncSettings,
+  _settings: GitHubSyncSettings,
   syncState: SyncRunState,
   companyId?: string
 ): Promise<GitHubSyncSettings> {
-  const next = upsertScopedSyncState(normalizeSettings(settings), syncState, companyId);
+  const next = upsertScopedSyncState(normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)), syncState, companyId);
 
   await ctx.state.set(SETTINGS_SCOPE, next);
-  await ctx.state.set(SYNC_STATE_SCOPE, syncState);
   return materializeScopedSettings(next, null, companyId);
 }
 
@@ -5286,7 +5348,22 @@ function getActiveRunningSyncForScope(companyId?: string): GitHubSyncSettings | 
     return null;
   }
 
-  return materializeScopedSettings(activeRunningSyncState, null, normalizedCompanyId);
+  // For this company's own live run, its per-company entry in the in-memory settings can be
+  // missing (first run) or stale (an old success or error entry kept until the first progress
+  // save). Always read the live running state for it, so the run shows as running and its own
+  // cancel is honoured.
+  const activeSettings =
+    normalizedCompanyId !== undefined
+    && activeRunningSyncCompanyId === normalizedCompanyId
+      ? {
+          ...activeRunningSyncState,
+          syncStateByCompanyId: {
+            ...(activeRunningSyncState.syncStateByCompanyId ?? {}),
+            [normalizedCompanyId]: activeRunningSyncState.syncState
+          }
+        }
+      : activeRunningSyncState;
+  return materializeScopedSettings(activeSettings, null, normalizedCompanyId);
 }
 
 async function reconcileOrphanedRunningSyncState(
@@ -5301,6 +5378,13 @@ async function reconcileOrphanedRunningSyncState(
   }
 
   const current = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  if (activeSyncPromise || activeRunningSyncState?.syncState.status === 'running') {
+    // Another scope's run is live in this worker. Finalizing this scope's orphan now would write
+    // the shared settings and clear the one instance-wide cancellation request, dropping the live
+    // run's pending cancel. Read only; the orphan is recovered once the live run finishes.
+    return materializeScopedSettings(current, null, normalizedCompanyId);
+  }
+
   const scopedSyncState = getScopedSyncState(current, normalizedCompanyId);
   if (scopedSyncState.status !== 'running') {
     return materializeScopedSettings(current, null, normalizedCompanyId);
@@ -6322,8 +6406,12 @@ function getScopedSyncState(
     return normalizeSyncState(settings.syncState);
   }
 
+  // A company with no saved sync state of its own always starts idle. The shared instance-wide
+  // syncState is written by every company's run, so falling back to it would show another
+  // company's status, error text, repository names and rate-limit backoff to this company. Only
+  // unscoped reads (no company id) use the shared state. No exceptions.
   const scopedSyncState = settings.syncStateByCompanyId?.[normalizedCompanyId];
-  return scopedSyncState ? normalizeSyncState(scopedSyncState) : normalizeSyncState(settings.syncState);
+  return scopedSyncState ? normalizeSyncState(scopedSyncState) : createIdleSyncState();
 }
 
 function getScopedScheduleFrequencyMinutes(
@@ -6932,8 +7020,26 @@ function areRepositoriesEqual(
     left.repo.trim().toLowerCase() === right.repo.trim().toLowerCase();
 }
 
-function doesImportedIssueRecordMatchMapping(entry: ImportedIssueRecord, mapping: RepositoryMapping): boolean {
+// Mapping ids default to mapping-1, mapping-2 and so on in every company, so a mapping id match
+// alone never ties an entry to a company. An entry saved with a company id must match the
+// mapping's company. An entry saved without one (legacy) only matches a company's mapping when
+// isLegacyEntryOwned confirms the Paperclip issue belongs to that company.
+type LegacyImportedIssueOwnership = (entry: ImportedIssueRecord, mapping: RepositoryMapping) => boolean;
+
+function doesImportedIssueRecordMatchMapping(
+  entry: ImportedIssueRecord,
+  mapping: RepositoryMapping,
+  isLegacyEntryOwned?: LegacyImportedIssueOwnership
+): boolean {
+  if (entry.companyId && mapping.companyId && entry.companyId !== mapping.companyId) {
+    return false;
+  }
+
   if (entry.mappingId === mapping.id) {
+    if (!entry.companyId && mapping.companyId) {
+      return isLegacyEntryOwned ? isLegacyEntryOwned(entry, mapping) : false;
+    }
+
     return true;
   }
 
@@ -6946,14 +7052,48 @@ function doesImportedIssueRecordMatchMapping(entry: ImportedIssueRecord, mapping
     entry.repositoryUrl === getNormalizedMappingRepositoryUrl(mapping);
 }
 
-function countImportedIssuesForMappings(
+async function collectOwnedLegacyImportedIssues(
+  ctx: PluginSetupContext,
   importRegistry: ImportedIssueRecord[],
   mappings: RepositoryMapping[]
+): Promise<LegacyImportedIssueOwnership> {
+  const ownedKeys = new Set<string>();
+  const checkedKeys = new Set<string>();
+  for (const entry of importRegistry) {
+    if (entry.companyId || !entry.paperclipIssueId) {
+      continue;
+    }
+
+    for (const mapping of mappings) {
+      const companyId = normalizeCompanyId(mapping.companyId);
+      if (!companyId || entry.mappingId !== mapping.id) {
+        continue;
+      }
+
+      const key = `${companyId}:${entry.paperclipIssueId}`;
+      if (checkedKeys.has(key)) {
+        continue;
+      }
+
+      checkedKeys.add(key);
+      if (await createPaperclipIssueOwnershipCheck(ctx, entry.paperclipIssueId, companyId)()) {
+        ownedKeys.add(key);
+      }
+    }
+  }
+
+  return (entry, mapping) => ownedKeys.has(`${normalizeCompanyId(mapping.companyId) ?? ''}:${entry.paperclipIssueId}`);
+}
+
+function countImportedIssuesForMappings(
+  importRegistry: ImportedIssueRecord[],
+  mappings: RepositoryMapping[],
+  isLegacyEntryOwned?: LegacyImportedIssueOwnership
 ): number {
   const uniqueImportedIssueIds = new Set<string>();
 
   for (const entry of importRegistry) {
-    const matchingMapping = mappings.find((mapping) => doesImportedIssueRecordMatchMapping(entry, mapping));
+    const matchingMapping = mappings.find((mapping) => doesImportedIssueRecordMatchMapping(entry, mapping, isLegacyEntryOwned));
     if (!matchingMapping) {
       continue;
     }
@@ -7020,8 +7160,50 @@ function refreshImportedIssueRecordForMapping(
   record.companyId = mapping.companyId;
 }
 
+// Paperclip issue ids are unique across companies, so the key leaves out companyId: a legacy
+// entry the run stamps with its company keeps the key it had before the stamp.
+function getImportedIssueRecordKey(entry: ImportedIssueRecord): string {
+  return `${entry.paperclipIssueId}\u0000${entry.githubIssueId}`;
+}
+
+// Applies only the changes a run made since its last saved registry view (adds, updates, deletes)
+// onto a fresh read, so entries others linked, changed or unlinked during the run are kept. An
+// entry the run updated but someone else deleted meanwhile stays deleted.
+function mergeImportRegistryChanges(
+  runStart: ImportedIssueRecord[],
+  runNext: ImportedIssueRecord[],
+  fresh: ImportedIssueRecord[]
+): ImportedIssueRecord[] {
+  const startByKey = new Map(runStart.map((entry) => [getImportedIssueRecordKey(entry), JSON.stringify(entry)]));
+  const nextKeys = new Set(runNext.map(getImportedIssueRecordKey));
+  const merged = fresh.filter((entry) => {
+    const key = getImportedIssueRecordKey(entry);
+    return !(startByKey.has(key) && !nextKeys.has(key));
+  });
+  for (const entry of runNext) {
+    const key = getImportedIssueRecordKey(entry);
+    const startJson = startByKey.get(key);
+    if (startJson === JSON.stringify(entry)) {
+      continue;
+    }
+
+    const index = merged.findIndex((candidate) => getImportedIssueRecordKey(candidate) === key);
+    if (index !== -1) {
+      merged[index] = entry;
+    } else if (startJson === undefined) {
+      merged.push(entry);
+    }
+  }
+
+  return merged;
+}
+
 function upsertImportedIssueRecord(nextRegistry: ImportedIssueRecord[], record: ImportedIssueRecord): ImportedIssueRecord {
   const index = nextRegistry.findIndex((entry) => {
+    if (entry.companyId && record.companyId && entry.companyId !== record.companyId) {
+      return false;
+    }
+
     if (entry.paperclipIssueId === record.paperclipIssueId) {
       return true;
     }
@@ -10491,6 +10673,14 @@ async function listImportedPaperclipIssuesForMapping(
       continue;
     }
 
+    // A link saved without a company id only counts for an issue the mapping's company owns.
+    if (
+      !record.data.companyId
+      && !(await createPaperclipIssueOwnershipCheck(ctx, record.paperclipIssueId, mapping.companyId)())
+    ) {
+      continue;
+    }
+
     importedIssuesByGitHubUrl.set(record.data.githubIssueUrl, {
       id: record.paperclipIssueId,
       createdAt: record.createdAt
@@ -10984,7 +11174,8 @@ async function listGitHubPullRequestLinkRecords(
 
 function doesGitHubPullRequestLinkRecordMatchMapping(
   record: GitHubPullRequestLinkRecord,
-  mapping: RepositoryMapping
+  mapping: RepositoryMapping,
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
   if (record.data.repositoryUrl !== getNormalizedMappingRepositoryUrl(mapping)) {
     return false;
@@ -10998,7 +11189,13 @@ function doesGitHubPullRequestLinkRecordMatchMapping(
     return false;
   }
 
-  return Boolean(mapping.companyId && mapping.paperclipProjectId);
+  if (!mapping.companyId || !mapping.paperclipProjectId) {
+    return false;
+  }
+
+  // Two companies can map the same repository, so a link saved without a company id only matches
+  // a mapping whose company owns the linked Paperclip issue.
+  return record.data.companyId ? true : Boolean(isLegacyLinkOwned?.(record, mapping));
 }
 
 function doesGitHubPullRequestLinkRecordMatchTarget(
@@ -11010,17 +11207,59 @@ function doesGitHubPullRequestLinkRecordMatchTarget(
   }
 
   switch (target.kind) {
+    // Scoped runs only process links saved with their company. A link with no company id would
+    // otherwise be synced by every company's run with that company's token. It still syncs on
+    // unscoped runs; re-save it inside its company to sync it on scoped runs.
     case 'company':
-      return !record.data.companyId || record.data.companyId === target.companyId;
+      return record.data.companyId === target.companyId;
     case 'project':
-      return (!record.data.companyId || record.data.companyId === target.companyId)
+      return record.data.companyId === target.companyId
         && (!record.data.paperclipProjectId || record.data.paperclipProjectId === target.projectId);
     case 'issue':
       return Boolean(target.issueId && record.paperclipIssueId === target.issueId)
-        && (!record.data.companyId || record.data.companyId === target.companyId);
+        && record.data.companyId === target.companyId;
     default:
       return true;
   }
+}
+
+type LegacyLinkOwnership = (record: { paperclipIssueId: string }, mapping: RepositoryMapping) => boolean;
+
+async function collectOwnedLegacyLinks(
+  ctx: PluginSetupContext,
+  records: Array<{ paperclipIssueId: string; data: { companyId?: string; repositoryUrl: string; paperclipProjectId?: string } }>,
+  mappings: RepositoryMapping[]
+): Promise<LegacyLinkOwnership> {
+  const ownedKeys = new Set<string>();
+  const checkedKeys = new Set<string>();
+  for (const record of records) {
+    if (record.data.companyId || !record.paperclipIssueId) {
+      continue;
+    }
+
+    for (const mapping of mappings) {
+      const companyId = normalizeCompanyId(mapping.companyId);
+      if (
+        !companyId
+        || record.data.repositoryUrl !== getNormalizedMappingRepositoryUrl(mapping)
+        || (record.data.paperclipProjectId && record.data.paperclipProjectId !== mapping.paperclipProjectId)
+      ) {
+        continue;
+      }
+
+      const key = `${companyId}:${record.paperclipIssueId}`;
+      if (checkedKeys.has(key)) {
+        continue;
+      }
+
+      checkedKeys.add(key);
+      if (await createPaperclipIssueOwnershipCheck(ctx, record.paperclipIssueId, companyId)()) {
+        ownedKeys.add(key);
+      }
+    }
+  }
+
+  return (record, mapping) => ownedKeys.has(`${normalizeCompanyId(mapping.companyId) ?? ''}:${record.paperclipIssueId}`);
 }
 
 async function listGitHubPullRequestIssueLinksForMapping(
@@ -11032,10 +11271,11 @@ async function listGitHubPullRequestIssueLinksForMapping(
     ...(target?.kind === 'issue' && target.issueId ? { paperclipIssueId: target.issueId } : {})
   });
   const recordsByKey = new Map<string, GitHubPullRequestLinkRecord>();
+  const isLegacyLinkOwned = await collectOwnedLegacyLinks(ctx, records, [mapping]);
 
   for (const record of records) {
     if (
-      !doesGitHubPullRequestLinkRecordMatchMapping(record, mapping)
+      !doesGitHubPullRequestLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned)
       || !doesGitHubPullRequestLinkRecordMatchTarget(record, target)
     ) {
       continue;
@@ -11070,9 +11310,10 @@ async function listGitHubIssueLinkedPaperclipIssueIdsForMapping(
   const issueLinks = await listGitHubIssueLinkRecords(ctx, {
     ...(target?.kind === 'issue' && target.issueId ? { paperclipIssueId: target.issueId } : {})
   });
+  const isLegacyLinkOwned = await collectOwnedLegacyLinks(ctx, issueLinks, [mapping]);
   for (const record of issueLinks) {
     if (
-      doesGitHubIssueLinkRecordMatchMapping(record, mapping)
+      doesGitHubIssueLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned)
       && doesGitHubIssueLinkRecordMatchTarget(record, target)
     ) {
       issueIds.add(record.paperclipIssueId);
@@ -11084,7 +11325,8 @@ async function listGitHubIssueLinkedPaperclipIssueIdsForMapping(
 
 function doesGitHubIssueLinkRecordMatchMapping(
   record: GitHubIssueLinkRecord,
-  mapping: RepositoryMapping
+  mapping: RepositoryMapping,
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
   if (record.data.repositoryUrl !== getNormalizedMappingRepositoryUrl(mapping)) {
     return false;
@@ -11098,7 +11340,13 @@ function doesGitHubIssueLinkRecordMatchMapping(
     return false;
   }
 
-  return Boolean(mapping.companyId && mapping.paperclipProjectId);
+  if (!mapping.companyId || !mapping.paperclipProjectId) {
+    return false;
+  }
+
+  // Two companies can map the same repository, so a link saved without a company id only matches
+  // a mapping whose company owns the linked Paperclip issue.
+  return record.data.companyId ? true : Boolean(isLegacyLinkOwned?.(record, mapping));
 }
 
 function doesGitHubIssueLinkRecordMatchTarget(
@@ -11110,14 +11358,17 @@ function doesGitHubIssueLinkRecordMatchTarget(
   }
 
   switch (target.kind) {
+    // Scoped runs only process links saved with their company. A link with no company id would
+    // otherwise be synced by every company's run with that company's token. It still syncs on
+    // unscoped runs; re-save it inside its company to sync it on scoped runs.
     case 'company':
-      return !record.data.companyId || record.data.companyId === target.companyId;
+      return record.data.companyId === target.companyId;
     case 'project':
-      return (!record.data.companyId || record.data.companyId === target.companyId)
+      return record.data.companyId === target.companyId
         && (!record.data.paperclipProjectId || record.data.paperclipProjectId === target.projectId);
     case 'issue':
       return Boolean(target.issueId && record.paperclipIssueId === target.issueId)
-        && (!record.data.companyId || record.data.companyId === target.companyId);
+        && record.data.companyId === target.companyId;
     default:
       return true;
   }
@@ -11125,16 +11376,18 @@ function doesGitHubIssueLinkRecordMatchTarget(
 
 function isGitHubIssueLinkCoveredByMappings(
   record: GitHubIssueLinkRecord,
-  mappings: RepositoryMapping[]
+  mappings: RepositoryMapping[],
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
-  return mappings.some((mapping) => doesGitHubIssueLinkRecordMatchMapping(record, mapping));
+  return mappings.some((mapping) => doesGitHubIssueLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned));
 }
 
 function isGitHubPullRequestLinkCoveredByMappings(
   record: GitHubPullRequestLinkRecord,
-  mappings: RepositoryMapping[]
+  mappings: RepositoryMapping[],
+  isLegacyLinkOwned?: LegacyLinkOwnership
 ): boolean {
-  return mappings.some((mapping) => doesGitHubPullRequestLinkRecordMatchMapping(record, mapping));
+  return mappings.some((mapping) => doesGitHubPullRequestLinkRecordMatchMapping(record, mapping, isLegacyLinkOwned));
 }
 
 async function listExternalGitHubLinkSyncWork(
@@ -11155,13 +11408,15 @@ async function listExternalGitHubLinkSyncWork(
     })
   ]);
 
+  const isLegacyIssueLinkOwned = await collectOwnedLegacyLinks(ctx, issueLinks, syncableMappings);
+  const isLegacyPullRequestLinkOwned = await collectOwnedLegacyLinks(ctx, pullRequestLinks, syncableMappings);
   for (const record of issueLinks) {
     if (!doesGitHubIssueLinkRecordMatchTarget(record, target)) {
       continue;
     }
 
     issueLinkedPaperclipIssueIds.add(record.paperclipIssueId);
-    if (isGitHubIssueLinkCoveredByMappings(record, syncableMappings)) {
+    if (isGitHubIssueLinkCoveredByMappings(record, syncableMappings, isLegacyIssueLinkOwned)) {
       continue;
     }
 
@@ -11175,7 +11430,7 @@ async function listExternalGitHubLinkSyncWork(
     if (
       !doesGitHubPullRequestLinkRecordMatchTarget(record, target)
       || issueLinkedPaperclipIssueIds.has(record.paperclipIssueId)
-      || isGitHubPullRequestLinkCoveredByMappings(record, syncableMappings)
+      || isGitHubPullRequestLinkCoveredByMappings(record, syncableMappings, isLegacyPullRequestLinkOwned)
     ) {
       continue;
     }
@@ -14807,12 +15062,21 @@ async function reconcileTransferredImportedIssues(
         transferredRepository: transfer.transferredRepository,
         paperclipApiBaseUrl: params.paperclipApiBaseUrl
       });
+      const sourceCompanyId = normalizeCompanyId(params.sourceMapping.companyId);
+      const isTransferredIssueOwned = sourceCompanyId
+        ? createPaperclipIssueOwnershipCheck(ctx, importedIssue.paperclipIssueId, sourceCompanyId)
+        : async () => true;
       for (let index = params.nextRegistry.length - 1; index >= 0; index -= 1) {
         const entry = params.nextRegistry[index];
-        if (
-          entry?.paperclipIssueId === importedIssue.paperclipIssueId &&
-          (!entry.companyId || entry.companyId === params.sourceMapping.companyId)
-        ) {
+        if (entry?.paperclipIssueId !== importedIssue.paperclipIssueId) {
+          continue;
+        }
+
+        // Only this company's entries, or a legacy entry for an issue this company owns.
+        const removable = entry.companyId
+          ? entry.companyId === sourceCompanyId
+          : await isTransferredIssueOwned();
+        if (removable) {
           params.nextRegistry.splice(index, 1);
         }
       }
@@ -18412,6 +18676,11 @@ async function buildProjectPullRequestIssueLookup(
       continue;
     }
 
+    // A link saved without a company id only counts for an issue in this company's project.
+    if (!record.data.companyId && !issuesById.has(record.paperclipIssueId)) {
+      continue;
+    }
+
     const linkedIssue = issuesById.get(record.paperclipIssueId);
     linkedIssuesByGitHubIssueUrl.set(
       record.data.githubIssueUrl,
@@ -18468,6 +18737,10 @@ async function buildProjectPullRequestIssueLookup(
     }
 
     if (fallbackIssuesByPullRequestNumber.has(record.data.githubPullRequestNumber)) {
+      continue;
+    }
+
+    if (!record.data.companyId && !issuesById.has(record.paperclipIssueId)) {
       continue;
     }
 
@@ -21279,6 +21552,70 @@ function shouldRunScheduledSync(settings: GitHubSyncSettings, scheduledAt?: stri
   return now - lastCheckedAt >= settings.scheduleFrequencyMinutes * 60_000;
 }
 
+// Paperclip hosts built from dev 806dd81e (paperclip#190) or later run the company-scoped
+// `sync.github-issues` job once per company and pass that company as `job.companyId`. The published
+// plugin SDK does not type the field yet, so read it narrowly. Older hosts never set it.
+function getJobCompanyId(job: unknown): string | undefined {
+  if (!job || typeof job !== 'object') {
+    return undefined;
+  }
+
+  const companyId = (job as { companyId?: unknown }).companyId;
+  return typeof companyId === 'string' ? normalizeCompanyId(companyId) : undefined;
+}
+
+// A company-scoped run judges its schedule only from that company's own saved sync state. The
+// shared instance-wide syncState is still written for older hosts and the global toolbar, but the
+// scoped read falls back to it, so company B would inherit company A's fresh checkedAt from the
+// same fanned-out tick and be skipped. A company with no saved state of its own counts as due.
+// Company-scoped reads never fall back to the shared syncState, so a company with no entry of its
+// own reads idle even while the shared slot says a sync is running. Before a scheduled run starts
+// any company's sync, check the instance level: a live run in this worker (activeSyncPromise or the
+// in-memory running state) means this tick waits, and a persisted shared running flag with no live
+// run is an orphan from a restarted worker, which is finalized here and not restarted on this tick.
+async function isSharedSyncRunningOrOrphaned(ctx: PluginSetupContext): Promise<boolean> {
+  if (activeSyncPromise || activeRunningSyncState?.syncState.status === 'running') {
+    return true;
+  }
+
+  const persistedSettings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  if (normalizeSyncState(persistedSettings.syncState).status !== 'running') {
+    return false;
+  }
+
+  await reconcileOrphanedRunningSyncState(ctx);
+  return true;
+}
+
+async function isCompanyScheduledSyncDue(
+  ctx: PluginSetupContext,
+  scopedSettings: GitHubSyncSettings,
+  companyId: string,
+  scheduledAt?: string
+): Promise<boolean> {
+  if (getActiveRunningSyncForScope(companyId)) {
+    return false;
+  }
+
+  const persistedSettings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  if (!persistedSettings.syncStateByCompanyId?.[companyId]) {
+    return true;
+  }
+
+  return shouldRunScheduledSync(scopedSettings, scheduledAt);
+}
+
+function selectScheduledSyncTargetsForJobCompany(
+  targets: Array<ResolvedSyncTarget | undefined>,
+  jobCompanyId: string | undefined
+): Array<ResolvedSyncTarget | undefined> {
+  if (!jobCompanyId) {
+    return targets;
+  }
+
+  return targets.filter((target) => normalizeCompanyId(target?.companyId) === jobCompanyId);
+}
+
 async function listScheduledSyncTargets(
   ctx: PluginSetupContext,
   settings: GitHubSyncSettings
@@ -21319,6 +21656,11 @@ async function performSync(
   const remoteActionRegistry = normalizeRemoteActionRegistry(await ctx.state.get(REMOTE_ACTION_REGISTRY_SCOPE));
   let companyKpiState = normalizeCompanyKpiState(await ctx.state.get(COMPANY_KPI_SCOPE));
   let companyKpiStateDirty = false;
+  const pendingCompanyKpiUpdates: Array<(state: CompanyKpiState) => CompanyKpiState> = [];
+  const applyCompanyKpiUpdate = (apply: (state: CompanyKpiState) => CompanyKpiState): void => {
+    companyKpiState = apply(companyKpiState);
+    pendingCompanyKpiUpdates.push(apply);
+  };
   const token = typeof options.resolvedToken === 'string'
     ? options.resolvedToken
     : await resolveGithubToken(ctx, { companyId: targetCompanyId });
@@ -21419,6 +21761,12 @@ async function performSync(
   let updatedDescriptionsCount = 0;
   const recoverableFailures: SyncProcessingFailure[] = [];
   const nextRegistry = [...importRegistry];
+  // Entries are updated in place during the run, so keep a detached copy of the run's registry view
+  // as of its last save (the start state until the first save).
+  let runRegistryBaseline: ImportedIssueRecord[] = JSON.parse(JSON.stringify(importRegistry)) as ImportedIssueRecord[];
+  // Legacy registry entries (no company id) only join a company's mapping when that company owns
+  // the Paperclip issue, checked once per entry and company before any mapping is processed.
+  const isLegacyImportedIssueOwned = await collectOwnedLegacyImportedIssues(ctx, importRegistry, mappings);
   const companyLabelDirectoryCache = new Map<string, PaperclipLabelDirectory>();
   const repositoryMaintainerCache = new Map<string, boolean>();
   const supportsPaperclipLabelMapping =
@@ -21441,13 +21789,30 @@ async function performSync(
     progress: currentProgress
   });
 
+  async function persistRunImportRegistry(): Promise<void> {
+    const freshRegistry = normalizeImportRegistry(await ctx.state.get(IMPORT_REGISTRY_SCOPE));
+    const savedRunView = JSON.parse(JSON.stringify(nextRegistry)) as ImportedIssueRecord[];
+    await ctx.state.set(IMPORT_REGISTRY_SCOPE, mergeImportRegistryChanges(runRegistryBaseline, savedRunView, freshRegistry));
+    // Move the baseline to what this save applied, so an entry the run already saved and someone
+    // else then unlinks is not re-added by the next save.
+    runRegistryBaseline = savedRunView;
+  }
+
   async function flushCompanyKpiState(): Promise<void> {
     if (!companyKpiStateDirty) {
       return;
     }
 
     try {
-      await ctx.state.set(COMPANY_KPI_SCOPE, companyKpiState);
+      // Replay only this run's KPI updates onto a fresh read, so KPI events others recorded
+      // during the run are kept.
+      let freshKpiState = normalizeCompanyKpiState(await ctx.state.get(COMPANY_KPI_SCOPE));
+      for (const apply of pendingCompanyKpiUpdates) {
+        freshKpiState = apply(freshKpiState);
+      }
+      await ctx.state.set(COMPANY_KPI_SCOPE, freshKpiState);
+      companyKpiState = freshKpiState;
+      pendingCompanyKpiUpdates.length = 0;
       companyKpiStateDirty = false;
     } catch (error) {
       ctx.logger.warn('GitHub Sync could not persist company KPI state.', {
@@ -21572,12 +21937,13 @@ async function performSync(
         continue;
       }
 
-      companyKpiState = upsertCompanyBacklogSnapshot(companyKpiState, companyId, {
+      const snapshot = {
         day,
         capturedAt,
         openIssueCount: planned.openIssueCount,
         repositoryCount: planned.repositoryCount
-      });
+      };
+      applyCompanyKpiUpdate((state) => upsertCompanyBacklogSnapshot(state, companyId, snapshot));
       companyKpiStateDirty = true;
     }
   }
@@ -21594,7 +21960,7 @@ async function performSync(
         const repository = requireRepositoryReference(mapping.repositoryUrl);
         octokitLogContext.repositoryUrl = repository.url;
         const importedIssueRecords = nextRegistry
-          .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping))
+          .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping, isLegacyImportedIssueOwned))
           .filter((entry) => doesImportedIssueMatchTarget(entry, options.target));
         const shouldLoadClosedIssues = options.target?.kind === 'issue' || importedIssueRecords.length > 0;
         currentProgress = {
@@ -21767,7 +22133,7 @@ async function performSync(
         const existingImportedPaperclipIssuesByUrl = await listImportedPaperclipIssuesForMapping(ctx, mapping);
         const importRegistryByIssueId = new Map(
           nextRegistry
-            .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping))
+            .filter((entry) => doesImportedIssueRecordMatchMapping(entry, mapping, isLegacyImportedIssueOwned))
             .filter((entry) => doesImportedIssueMatchTarget(entry, options.target))
             .map((entry) => [entry.githubIssueId, entry])
         );
@@ -21970,17 +22336,20 @@ async function performSync(
           repositoryMaintainerCache,
           failureContext,
           recoverableFailures,
-          async () => ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry),
+          async () => persistRunImportRegistry(),
           throwIfSyncCancelled,
           async (params) => {
-            const recorded = recordCompanyActivityMetricEvent(companyKpiState, {
+            const event = {
               companyId: params.companyId,
-              metric: 'githubIssuesClosedCount',
+              metric: 'githubIssuesClosedCount' as const,
               eventKey: `${params.repositoryUrl}/issues/${params.githubIssueNumber}:${coerceDate(params.occurredAt).toISOString()}`,
               repositoryUrl: params.repositoryUrl,
               occurredAt: params.occurredAt
-            });
-            companyKpiState = recorded.state;
+            };
+            const recorded = recordCompanyActivityMetricEvent(companyKpiState, event);
+            if (recorded.recorded) {
+              applyCompanyKpiUpdate((state) => recordCompanyActivityMetricEvent(state, event).state);
+            }
             companyKpiStateDirty = companyKpiStateDirty || recorded.recorded;
           },
           async (progress) => {
@@ -22130,7 +22499,7 @@ async function performSync(
           // an unrelated registry array. Establish the durable baseline before
           // any status action so failures and worker restarts cannot consume a
           // trusted comment or lose a pending wake.
-          await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+          await persistRunImportRegistry();
         }
         const synchronizationResult = await synchronizePaperclipIssueStatuses(
           ctx,
@@ -22149,17 +22518,20 @@ async function performSync(
           repositoryMaintainerCache,
           failureContext,
           recoverableFailures,
-          async () => ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry),
+          async () => persistRunImportRegistry(),
           throwIfSyncCancelled,
           async (params) => {
-            const recorded = recordCompanyActivityMetricEvent(companyKpiState, {
+            const event = {
               companyId: params.companyId,
-              metric: 'githubIssuesClosedCount',
+              metric: 'githubIssuesClosedCount' as const,
               eventKey: `${params.repositoryUrl}/issues/${params.githubIssueNumber}:${coerceDate(params.occurredAt).toISOString()}`,
               repositoryUrl: params.repositoryUrl,
               occurredAt: params.occurredAt
-            });
-            companyKpiState = recorded.state;
+            };
+            const recorded = recordCompanyActivityMetricEvent(companyKpiState, event);
+            if (recorded.recorded) {
+              applyCompanyKpiUpdate((state) => recordCompanyActivityMetricEvent(state, event).state);
+            }
             companyKpiStateDirty = companyKpiStateDirty || recorded.recorded;
           },
           async (progress) => {
@@ -22292,8 +22664,12 @@ async function performSync(
         })
       };
       await saveSettingsSyncState(ctx, currentSettings, next.syncState, targetCompanyId);
-      await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
-      return materializeScopedSettings(next, config, targetCompanyId);
+      await persistRunImportRegistry();
+      return materializeScopedSettings(
+        upsertScopedSyncState(normalizeSettings(currentSettings), next.syncState, targetCompanyId),
+        config,
+        targetCompanyId
+      );
     }
 
     const nextSyncState = {
@@ -22307,7 +22683,7 @@ async function performSync(
       lastRunTrigger: trigger
     };
     const next = await saveSettingsSyncState(ctx, currentSettings, nextSyncState, targetCompanyId);
-    await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+    await persistRunImportRegistry();
     return next;
   } catch (error) {
     if (error instanceof SyncCancellationError) {
@@ -22325,7 +22701,7 @@ async function performSync(
         }),
         targetCompanyId
       );
-      await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
+      await persistRunImportRegistry();
       return next;
     }
 
@@ -22348,11 +22724,35 @@ async function performSync(
       })
     };
     await saveSettingsSyncState(ctx, currentSettings, next.syncState, targetCompanyId);
-    await ctx.state.set(IMPORT_REGISTRY_SCOPE, nextRegistry);
-    return materializeScopedSettings(next, config, targetCompanyId);
+    await persistRunImportRegistry();
+    // Materialize from the settings with this run's final state written to its own scope, so a
+    // company-scoped result carries the error state, not the company's stale running entry.
+    return materializeScopedSettings(
+      upsertScopedSyncState(normalizeSettings(currentSettings), next.syncState, targetCompanyId),
+      config,
+      targetCompanyId
+    );
   } finally {
     await flushCompanyKpiState();
   }
+}
+
+const OTHER_SYNC_BUSY_MESSAGE =
+  'Another GitHub sync is running in this Paperclip instance. This company sync was not started; try again in a moment.';
+
+async function buildOtherSyncBusyResult(
+  ctx: PluginSetupContext,
+  companyId: string
+): Promise<GitHubSyncSettings> {
+  const persistedSettings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  const scopedSettings = materializeScopedSettings(persistedSettings, null, companyId);
+  return {
+    ...scopedSettings,
+    syncState: {
+      ...scopedSettings.syncState,
+      message: OTHER_SYNC_BUSY_MESSAGE
+    }
+  };
 }
 
 async function startSync(
@@ -22364,6 +22764,24 @@ async function startSync(
     target?: ResolvedSyncTarget;
   } = {}
 ): Promise<GitHubSyncSettings> {
+  while (pendingSyncStart && !activeSyncPromise) {
+    // Another call is between its busy check and its claim. Wait to see what it becomes.
+    await pendingSyncStart;
+  }
+
+  const requestedCompanyId = normalizeCompanyId(options.target?.companyId);
+  if (activeSyncPromise && requestedCompanyId && activeRunningSyncCompanyId !== requestedCompanyId) {
+    // The worker runs one sync at a time. Another company's (or an unscoped) run is in progress,
+    // and its result must never be handed to this company. Callers that wait get this company's
+    // own sync once the other run finishes; prompt callers get this company's own state.
+    if (options.awaitCompletion) {
+      await activeSyncPromise.catch(() => undefined);
+      return startSync(ctx, trigger, options);
+    }
+
+    return buildOtherSyncBusyResult(ctx, requestedCompanyId);
+  }
+
   if (activeSyncPromise) {
     if (options.awaitCompletion) {
       return activeSyncPromise;
@@ -22377,6 +22795,44 @@ async function startSync(
     return quickResult ?? await getActiveOrCurrentSyncState(ctx);
   }
 
+  const claim = claimSyncStart();
+  try {
+    return await startClaimedSync(ctx, trigger, options);
+  } finally {
+    // Early returns release here. A claim already released when activeSyncPromise was assigned
+    // (and possibly replaced by a later caller's claim) is left alone.
+    if (pendingSyncStart === claim) {
+      releaseSyncStartClaim();
+    }
+  }
+}
+
+function claimSyncStart(): Promise<void> {
+  const claim = new Promise<void>((resolve) => {
+    releasePendingSyncStart = resolve;
+  });
+  pendingSyncStart = claim;
+  return claim;
+}
+
+// Called synchronously right after activeSyncPromise is assigned, while the claim is still this
+// call's own (other callers wait on it instead of claiming), and from the early-return path.
+function releaseSyncStartClaim(): void {
+  const release = releasePendingSyncStart;
+  pendingSyncStart = null;
+  releasePendingSyncStart = null;
+  release?.();
+}
+
+async function startClaimedSync(
+  ctx: PluginSetupContext,
+  trigger: 'manual' | 'schedule' | 'retry',
+  options: {
+    awaitCompletion?: boolean;
+    paperclipApiBaseUrl?: string;
+    target?: ResolvedSyncTarget;
+  }
+): Promise<GitHubSyncSettings> {
   await reconcileOrphanedRunningSyncState(ctx, options.target?.companyId);
 
   const targetCompanyId = normalizeCompanyId(options.target?.companyId);
@@ -22416,17 +22872,24 @@ async function startSync(
       ? resolveTrustedPaperclipApiBaseUrlInput(options.paperclipApiBaseUrl, persistedSettings, config, targetCompanyId)
       : getConfiguredPaperclipApiBaseUrl(persistedSettings, config, targetCompanyId);
 
-  if (nextPaperclipApiBaseUrl !== currentSettings.paperclipApiBaseUrl) {
+  // Compare with the fresh stored value this write lands on, not the config-materialized or
+  // run-start one: run saves no longer write the whole settings record back, so the live URL is
+  // persisted here. A URL someone else saved since the run read settings is kept.
+  const freshSettingsForUrl = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
+  const storedPaperclipApiBaseUrl = materializeScopedSettings(freshSettingsForUrl, null, targetCompanyId).paperclipApiBaseUrl;
+  if (
+    nextPaperclipApiBaseUrl !== storedPaperclipApiBaseUrl
+    && storedPaperclipApiBaseUrl === materializeScopedSettings(persistedSettings, null, targetCompanyId).paperclipApiBaseUrl
+  ) {
     const nextPersistedSettings = upsertScopedPaperclipApiBaseUrl(
       {
-        ...persistedSettings,
+        ...freshSettingsForUrl,
         updatedAt: new Date().toISOString()
       },
       nextPaperclipApiBaseUrl,
       targetCompanyId
     );
     await ctx.state.set(SETTINGS_SCOPE, nextPersistedSettings);
-    await ctx.state.set(SYNC_STATE_SCOPE, currentSettings.syncState);
     currentSettings = materializeScopedSettings(nextPersistedSettings, config, targetCompanyId);
   }
 
@@ -22494,6 +22957,7 @@ async function startSync(
       activeSyncPromise = null;
     }
   })();
+  releaseSyncStartClaim();
 
   if (options.awaitCompletion) {
     return activeSyncPromise;
@@ -24247,6 +24711,17 @@ export function shouldStartWorkerHost(moduleUrl: string, entry = process.argv[1]
 }
 
 export const __testing = {
+  persistCompanyActivityMetricEvent,
+  listGitHubPullRequestIssueLinksForMapping,
+  listGitHubIssueLinkedPaperclipIssueIdsForMapping,
+  buildProjectPullRequestIssueLookup,
+  listImportedPaperclipIssuesForMapping,
+  resolveProjectScopedMappings,
+  upsertImportedIssueRecord,
+  resolveGitHubToolRepository,
+  resolveGitHubPullRequestToolTarget,
+  doesGitHubIssueLinkRecordMatchTarget,
+  doesGitHubPullRequestLinkRecordMatchTarget,
   listIssueInteractionEvents,
   buildDirectPullRequestActionFingerprint,
   buildRemoteActionFingerprint,
@@ -24364,7 +24839,14 @@ const plugin = definePlugin({
       return {
         ...getPublicSettingsForScope(settingsForResponse, requestedCompanyId),
         ...(includeAssignees ? { availableAssignees } : {}),
-        totalSyncedIssuesCount: countImportedIssuesForMappings(importRegistry, scopedMappings),
+        totalSyncedIssuesCount: countImportedIssuesForMappings(
+          importRegistry,
+          scopedMappings,
+          // The unscoped instance view keeps counting legacy entries; a company only counts its own.
+          requestedCompanyId
+            ? await collectOwnedLegacyImportedIssues(ctx, importRegistry, scopedMappings)
+            : () => true
+        ),
         agentToolAccess,
         paperclipApiBaseUrlConfigured: Boolean(normalizePaperclipApiBaseUrl(config.paperclipApiBaseUrl)),
         githubTokenConfigured,
@@ -24620,7 +25102,6 @@ const plugin = definePlugin({
       });
 
       await ctx.state.set(SETTINGS_SCOPE, next);
-      await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
       clearGitHubRepositoryTokenCapabilityAudits();
       const scopedGitHubTokenLogin =
         (requestedCompanyId && 'githubTokenLogin' in record ? requestedGitHubTokenLogin : undefined)
@@ -24708,7 +25189,6 @@ const plugin = definePlugin({
       const next = materializeScopedSettings(nextBase, config, companyId);
 
       await ctx.state.set(SETTINGS_SCOPE, next);
-      await ctx.state.set(SYNC_STATE_SCOPE, next.syncState);
 
       return {
         ...getPublicSettingsForScope(next, companyId),
@@ -24829,16 +25309,35 @@ const plugin = definePlugin({
         ...(issueId ? { issueId } : {})
       });
 
-      return startSync(ctx, 'manual', {
+      const result = await startSync(ctx, 'manual', {
         awaitCompletion: waitForCompletion,
         ...(typeof paperclipApiBaseUrl === 'string' ? { paperclipApiBaseUrl } : {}),
         ...(target ? { target } : {})
       });
+      // A company-scoped caller only gets its own company's slice of the settings: its mappings and
+      // sync state, never the per-company maps that hold other companies' status and identities.
+      const resultCompanyId = normalizeCompanyId(target?.companyId ?? companyId);
+      return resultCompanyId ? getPublicSettingsForScope(result, resultCompanyId) : result;
     });
 
-    ctx.actions.register('sync.cancel', async () => {
-      const persistedRunningSyncCompanyId =
-        activeRunningSyncState?.syncState.status === 'running'
+    ctx.actions.register('sync.cancel', async (input, actionContext) => {
+      const callerCompanyId = normalizeCompanyId(normalizeActionRecord(input, actionContext).companyId);
+      const liveRunIsActive = activeRunningSyncState?.syncState.status === 'running';
+      if (callerCompanyId && liveRunIsActive && activeRunningSyncCompanyId !== callerCompanyId) {
+        // A company may only cancel its own run. Another company's (or an unscoped) live run is
+        // left alone, and the caller gets a read-only view of its own state. Orphan recovery is
+        // not run here: it writes the shared settings and clears the one instance-wide
+        // cancellation request, which would drop the live run's pending cancel. The caller's
+        // orphaned run (if any) is recovered once the live run finishes.
+        return getPublicSettingsForScope(
+          materializeScopedSettings(normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)), null, callerCompanyId),
+          callerCompanyId
+        );
+      }
+
+      const persistedRunningSyncCompanyId = callerCompanyId
+        ? callerCompanyId
+        : liveRunIsActive
           ? activeRunningSyncCompanyId
           : resolvePersistedRunningSyncCompanyId(normalizeSettings(await ctx.state.get(SETTINGS_SCOPE)));
       const currentSettings = await reconcileOrphanedRunningSyncState(
@@ -24847,7 +25346,7 @@ const plugin = definePlugin({
         'cancelled'
       );
       if (currentSettings.syncState.status !== 'running') {
-        return currentSettings;
+        return callerCompanyId ? getPublicSettingsForScope(currentSettings, callerCompanyId) : currentSettings;
       }
 
       const existingRequest =
@@ -24874,7 +25373,7 @@ const plugin = definePlugin({
         persistedRunningSyncCompanyId === null ? undefined : persistedRunningSyncCompanyId
       );
       activeRunningSyncState = next;
-      return next;
+      return callerCompanyId ? getPublicSettingsForScope(next, callerCompanyId) : next;
     });
 
     registerGitHubAgentTools(ctx);
@@ -24882,9 +25381,19 @@ const plugin = definePlugin({
     ctx.jobs.register('sync.github-issues', async (job) => {
       const settings = normalizeSettings(await ctx.state.get(SETTINGS_SCOPE));
       const trigger = job.trigger === 'retry' ? 'retry' : 'schedule';
-      const scheduledTargets = await listScheduledSyncTargets(ctx, settings);
+      const jobCompanyId = getJobCompanyId(job);
+      const scheduledTargets = selectScheduledSyncTargetsForJobCompany(
+        await listScheduledSyncTargets(ctx, settings),
+        jobCompanyId
+      );
 
       if (scheduledTargets.length === 0) {
+        if (jobCompanyId) {
+          // A company-scoped run for a company with no mappings or links has nothing to sync, and
+          // must not fall back to the instance-wide sync that would touch other companies.
+          return;
+        }
+
         const reconciledSettings = await reconcileOrphanedRunningSyncState(ctx);
         if (job.trigger === 'schedule' && !shouldRunScheduledSync(reconciledSettings, job.scheduledAt)) {
           return;
@@ -24894,9 +25403,18 @@ const plugin = definePlugin({
         return;
       }
 
+      if (await isSharedSyncRunningOrOrphaned(ctx)) {
+        return;
+      }
+
       for (const target of scheduledTargets) {
         const scopedSettings = await reconcileOrphanedRunningSyncState(ctx, target?.companyId);
-        if (job.trigger === 'schedule' && !shouldRunScheduledSync(scopedSettings, job.scheduledAt)) {
+        if (
+          job.trigger === 'schedule'
+          && !(jobCompanyId
+            ? await isCompanyScheduledSyncDue(ctx, scopedSettings, jobCompanyId, job.scheduledAt)
+            : shouldRunScheduledSync(scopedSettings, job.scheduledAt))
+        ) {
           continue;
         }
 
