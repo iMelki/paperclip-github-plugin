@@ -32,7 +32,7 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Test
+      - name: Test (including synthetic import contract and negative proof)
         run: pnpm test
 
       - name: Build
