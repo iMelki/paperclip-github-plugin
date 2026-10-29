@@ -23251,15 +23251,20 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     }) as Array<{ remoteActionFingerprint?: string }>;
     assert.match(registryAfterFirstAction[0]?.remoteActionFingerprint ?? '', /^[a-f0-9]{64}$/);
 
+    // The agent blocks the issue again while the PR state is unchanged. That deliberate block is
+    // kept (the recorded unblock hash survives the registry load), so sync neither re-opens nor
+    // re-wakes it, and a further pass on the same state stays quiet too.
     await acknowledgeAndReset();
-    await syncAndExpectWake();
+    const deliberateBlock = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+    assert.equal(deliberateBlock.syncState.status, 'success');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    assert.equal(transitionComments.length, 0);
+    assert.equal(statusMutations.length, 0);
+    assert.equal(wakeRequests.length, 0);
 
-    transitionComments.length = 0;
-    statusMutations.length = 0;
-    wakeRequests.length = 0;
     const stableRetry = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
     assert.equal(stableRetry.syncState.status, 'success');
-    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'in_progress');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
     assert.equal(transitionComments.length, 0);
     assert.equal(statusMutations.length, 0);
     assert.equal(wakeRequests.length, 0);
