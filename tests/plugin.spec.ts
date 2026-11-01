@@ -23251,15 +23251,20 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     }) as Array<{ remoteActionFingerprint?: string }>;
     assert.match(registryAfterFirstAction[0]?.remoteActionFingerprint ?? '', /^[a-f0-9]{64}$/);
 
+    // The agent blocks the issue again while the PR state is unchanged. That deliberate block is
+    // kept (the recorded unblock hash survives the registry load), so sync neither re-opens nor
+    // re-wakes it, and a further pass on the same state stays quiet too.
     await acknowledgeAndReset();
-    await syncAndExpectWake();
+    const deliberateBlock = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+    assert.equal(deliberateBlock.syncState.status, 'success');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    assert.equal(transitionComments.length, 0);
+    assert.equal(statusMutations.length, 0);
+    assert.equal(wakeRequests.length, 0);
 
-    transitionComments.length = 0;
-    statusMutations.length = 0;
-    wakeRequests.length = 0;
     const stableRetry = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
     assert.equal(stableRetry.syncState.status, 'success');
-    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'in_progress');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
     assert.equal(transitionComments.length, 0);
     assert.equal(statusMutations.length, 0);
     assert.equal(wakeRequests.length, 0);
@@ -23286,7 +23291,16 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     await syncAndExpectWake();
     await acknowledgeAndReset();
     checkConclusion = 'FAILURE';
-    await syncAndExpectWake();
+    // The status write that would lift the block fails. The block was not lifted, so the unblock
+    // hash must not be recorded; otherwise the retry would read the block as deliberate and hold it.
+    failNextStatusMutation = true;
+    const failedUnblock = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+    assert.equal(failedUnblock.syncState.status, 'error');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    transitionComments.length = 0;
+    statusMutations.length = 0;
+    wakeRequests.length = 0;
+    await syncAndExpectWake(0);
 
     await acknowledgeAndReset();
     mergeable = 'MERGEABLE';
@@ -34425,5 +34439,321 @@ test('the live Paperclip API URL save keeps another company mapping saved while 
     run.release();
     await run.runResult.catch(() => undefined);
     run.restoreFetch();
+  }
+});
+
+test('sync stops re-opening a deliberately blocked issue while the PR state is unchanged', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const { buildExternalPullRequestStateHash, shouldPreserveDeliberateBlockedWait } = workerModule.__testing;
+
+  // The shape that produced 3,233 `blocked -> in progress` comments on this instance: a PR whose
+  // required check is red for a reason nobody in the company can clear (the contributor CLA gate).
+  const claBlockedPullRequest = {
+    repositoryUrl: 'https://github.com/micronaut-projects/micronaut-gradle-plugin',
+    number: 1281,
+    headSha: 'c5378b46',
+    ciState: 'red',
+    mergeability: 'mergeable',
+    mergeStateStatus: 'blocked',
+    reviewDecision: 'review_required',
+    hasUnresolvedReviewThreads: false
+  };
+  const stateHash = buildExternalPullRequestStateHash([claBlockedPullRequest]);
+  assert.ok(stateHash);
+
+  // Pass 1: nothing recorded yet, so sync is free to move the issue back to active work.
+  assert.equal(shouldPreserveDeliberateBlockedWait({
+    currentStatus: 'blocked',
+    nextStatus: 'in_progress',
+    currentExternalStateHash: stateHash,
+    unblockedExternalStateHash: undefined
+  }), false);
+
+  // The agent re-blocks. Pass 2 sees the identical PR and must leave it alone.
+  assert.equal(shouldPreserveDeliberateBlockedWait({
+    currentStatus: 'blocked',
+    nextStatus: 'in_progress',
+    currentExternalStateHash: stateHash,
+    unblockedExternalStateHash: stateHash
+  }), true);
+
+  // A new head SHA is a real external change: routing resumes immediately.
+  const afterPush = buildExternalPullRequestStateHash([{ ...claBlockedPullRequest, headSha: 'deadbeef' }]);
+  assert.notEqual(afterPush, stateHash);
+  assert.equal(shouldPreserveDeliberateBlockedWait({
+    currentStatus: 'blocked',
+    nextStatus: 'in_progress',
+    currentExternalStateHash: afterPush,
+    unblockedExternalStateHash: stateHash
+  }), false);
+
+  // So is the CLA finally being signed (red -> green).
+  const afterCla = buildExternalPullRequestStateHash([{ ...claBlockedPullRequest, ciState: 'green' }]);
+  assert.equal(shouldPreserveDeliberateBlockedWait({
+    currentStatus: 'blocked',
+    nextStatus: 'in_review',
+    currentExternalStateHash: afterCla,
+    unblockedExternalStateHash: stateHash
+  }), false);
+
+  // The guard is only about leaving `blocked`; it never forces an issue into it.
+  assert.equal(shouldPreserveDeliberateBlockedWait({
+    currentStatus: 'in_review',
+    nextStatus: 'in_progress',
+    currentExternalStateHash: stateHash,
+    unblockedExternalStateHash: stateHash
+  }), false);
+
+  // An issue with no linked PR has no external state to compare, so it is never held back.
+  assert.equal(buildExternalPullRequestStateHash([]), undefined);
+  assert.equal(shouldPreserveDeliberateBlockedWait({
+    currentStatus: 'blocked',
+    nextStatus: 'todo',
+    currentExternalStateHash: undefined,
+    unblockedExternalStateHash: undefined
+  }), false);
+});
+
+test('external PR state hash is order-independent and covers every field sync reacts to', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const { buildExternalPullRequestStateHash } = workerModule.__testing;
+  const base = {
+    repositoryUrl: 'https://github.com/micronaut-projects/micronaut-core',
+    number: 7,
+    headSha: 'aaa111',
+    ciState: 'red',
+    mergeability: 'mergeable',
+    mergeStateStatus: 'blocked',
+    reviewDecision: 'review_required',
+    hasUnresolvedReviewThreads: false
+  };
+  const other = { ...base, number: 9, headSha: 'bbb222' };
+
+  assert.equal(
+    buildExternalPullRequestStateHash([base, other]),
+    buildExternalPullRequestStateHash([other, base]),
+    'the hash must not depend on the order GitHub returned the pull requests'
+  );
+
+  for (const [field, value] of [
+    ['headSha', 'ccc333'],
+    ['ciState', 'green'],
+    ['mergeability', 'conflicting'],
+    ['mergeStateStatus', 'clean'],
+    ['reviewDecision', 'approved'],
+    ['hasUnresolvedReviewThreads', true]
+  ] as const) {
+    assert.notEqual(
+      buildExternalPullRequestStateHash([{ ...base, [field]: value }]),
+      buildExternalPullRequestStateHash([base]),
+      `${field} must be part of the external state hash`
+    );
+  }
+});
+
+test('a tombstoned GitHub issue link no longer counts as a live link', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const { isLiveGitHubIssueLinkRecord } = workerModule.__testing;
+
+  // `issue.unlinkGitHubItem` tombstones the link and drops the registry entry. The registry-repair
+  // lookup consults link records to answer "is this GitHub issue already imported?", so a tombstone
+  // must not answer yes — otherwise sync re-adopts the issue that was just detached and never
+  // imports a fresh one.
+  assert.equal(isLiveGitHubIssueLinkRecord({ status: 'unlinked' }), false);
+  assert.equal(isLiveGitHubIssueLinkRecord({ status: 'linked' }), true);
+  assert.equal(isLiveGitHubIssueLinkRecord({}), true, 'records written before the status existed are live');
+});
+
+test('the unblock budget is only reset by a real transition into blocked', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const { resolveUnblockedExternalStateHash } = workerModule.__testing;
+
+  // Leaving `blocked`: record what we reacted to, so an identical later pass is a no-op.
+  assert.equal(resolveUnblockedExternalStateHash({
+    currentStatus: 'blocked', nextStatus: 'in_progress',
+    currentExternalStateHash: 'state-a', previousHash: undefined
+  }), 'state-a');
+
+  // Staying `blocked` — another rule preserved it, or this guard did. Keeping the recorded value
+  // is the whole point: clearing it here drops the budget with no external change and the very
+  // next pass re-opens on the same PR state, which is the loop coming back.
+  assert.equal(resolveUnblockedExternalStateHash({
+    currentStatus: 'blocked', nextStatus: 'blocked',
+    currentExternalStateHash: 'state-a', previousHash: 'state-a'
+  }), 'state-a');
+
+  // A genuine transition into `blocked` starts a fresh budget.
+  assert.equal(resolveUnblockedExternalStateHash({
+    currentStatus: 'in_progress', nextStatus: 'blocked',
+    currentExternalStateHash: 'state-b', previousHash: 'state-a'
+  }), undefined);
+
+  // Untouched when the issue was never blocked and is not becoming blocked.
+  assert.equal(resolveUnblockedExternalStateHash({
+    currentStatus: 'in_review', nextStatus: 'in_progress',
+    currentExternalStateHash: 'state-b', previousHash: 'state-a'
+  }), 'state-a');
+});
+
+test('registry loads keep the recorded unblock hash so a deliberate block is not re-opened', async () => {
+  const workerModule = await importFreshWorkerModule();
+  const { normalizeImportRegistry, normalizeRemoteActionRegistry } = workerModule.__testing;
+  const hash = 'a'.repeat(64);
+  const [imported] = normalizeImportRegistry([
+    {
+      mappingId: 'mapping-a',
+      githubIssueId: 1,
+      paperclipIssueId: 'issue-1',
+      importedAt: '2026-04-01T00:00:00.000Z',
+      unblockedExternalStateHash: hash
+    }
+  ]);
+  assert.equal(imported?.unblockedExternalStateHash, hash);
+  const [action] = normalizeRemoteActionRegistry([{ key: 'action-1', unblockedExternalStateHash: hash }]);
+  assert.equal(action?.unblockedExternalStateHash, hash);
+  const [rejected] = normalizeImportRegistry([
+    {
+      mappingId: 'mapping-a',
+      githubIssueId: 1,
+      paperclipIssueId: 'issue-1',
+      importedAt: '2026-04-01T00:00:00.000Z',
+      unblockedExternalStateHash: 'not-a-hash'
+    }
+  ]);
+  assert.equal(rejected?.unblockedExternalStateHash, undefined);
+});
+
+test('sync.runNow records the direct PR unblock hash only after the status write lands, so a deliberate re-block holds', async () => {
+  // Pins where the remote-action record gets its unblock hash: a failed status write must not
+  // record it, a landed one must, and a new head commit must resume routing.
+  const harness = await createProjectPullRequestsHarness();
+  const originalFetch = globalThis.fetch;
+  const originalUpdate = harness.ctx.issues.update;
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1',
+    projectId: 'project-1',
+    title: 'Direct PR deliberate block',
+    description: 'An agent blocks this issue on purpose.'
+  });
+  await upsertDirectPullRequestLink(harness, issue.id, 50, {
+    title: 'Direct PR deliberate block',
+    followThroughAssigneeAgentId: 'engineer-agent'
+  });
+  harness.ctx.agents.get = async (agentId, companyId) => agentId === 'engineer-agent' && companyId === 'company-1'
+    ? { id: agentId, companyId, name: 'Engineer' } as never
+    : null;
+  await originalUpdate(issue.id, { status: 'blocked', assigneeAgentId: 'engineer-agent' } as never, 'company-1');
+
+  let headSha = 'c'.repeat(40);
+  const checkState = 'FAILURE';
+  const statusUpdates: string[] = [];
+  let failNextStatusUpdate = false;
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    if (issueId === issue.id && patch && typeof patch === 'object' && 'status' in patch) {
+      statusUpdates.push(String((patch as { status?: unknown }).status));
+      if (failNextStatusUpdate) {
+        failNextStatusUpdate = false;
+        throw new Error('Injected status update failure.');
+      }
+    }
+    return originalUpdate(issueId, patch, companyId);
+  };
+  const ciContexts = () => ({
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{
+      __typename: 'StatusContext',
+      context: 'ci',
+      state: checkState,
+      createdAt: '2026-04-12T09:00:00Z',
+      updatedAt: '2026-04-12T09:10:00Z'
+    }]
+  });
+  globalThis.fetch = async (input, init) => {
+    const requestUrl = getRequestUrl(input);
+    const requestPathname = getDecodedRequestPathname(input);
+    if (requestPathname === '/repos/paperclipai/example-repo/issues') {
+      return jsonResponse([]);
+    }
+    if (requestPathname === '/repos/paperclipai/example-repo/pulls/50') {
+      return jsonResponse({
+        number: 50,
+        title: 'Direct PR deliberate block',
+        body: 'Open.',
+        html_url: 'https://github.com/paperclipai/example-repo/pull/50',
+        state: 'open',
+        merged: false,
+        head: { sha: headSha }
+      });
+    }
+    if (requestPathname === '/graphql') {
+      const { query } = getGraphqlRequest(init);
+      if (query.includes('query GitHubRepositoryOpenIssueLinkedPullRequests')) {
+        return graphqlResponse({ repository: { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } });
+      }
+      if (query.includes('query GitHubRepositoryOpenPullRequestStatuses')) {
+        return graphqlResponse({ repository: { pullRequests: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [{
+            number: 50, headRefOid: headSha, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null,
+            reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+            statusCheckRollup: { contexts: ciContexts() }
+          }]
+        } } });
+      }
+      if (query.includes('query GitHubPullRequestReviewThreads')) {
+        return graphqlResponse({ repository: { pullRequest: { reviewThreads: {
+          pageInfo: { hasNextPage: false, endCursor: null }, nodes: []
+        } } } });
+      }
+      if (query.includes('query GitHubPullRequestCiContexts')) {
+        return graphqlResponse({ repository: { pullRequest: {
+          headRefOid: headSha, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null,
+          statusCheckRollup: { contexts: ciContexts() }
+        } } });
+      }
+    }
+    throw new Error(`Unexpected fetch during direct PR deliberate block test: ${requestUrl}`);
+  };
+  const runSync = async () => {
+    const result = await harness.performAction('sync.runNow', {
+      companyId: 'company-1', issueId: issue.id, waitForCompletion: true
+    }) as { syncState: { status: string } };
+    assert.equal(result.syncState.status, 'success');
+    return (await harness.ctx.issues.get(issue.id, 'company-1'))?.status;
+  };
+  const readRecord = () => (harness.getState({
+    scopeKind: 'instance', stateKey: 'paperclip-github-plugin-remote-action-registry'
+  }) as Array<Record<string, unknown>> | undefined)?.find((record) => record.key === `direct-pr:company-1:${issue.id}`);
+
+  try {
+    // Pass 0: the status write fails. The block was not lifted, so nothing may record it as lifted.
+    failNextStatusUpdate = true;
+    await harness.performAction('sync.runNow', { companyId: 'company-1', issueId: issue.id, waitForCompletion: true });
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    assert.equal(readRecord()?.unblockedExternalStateHash, undefined);
+    statusUpdates.length = 0;
+    // Pass 1: CI is red, so sync lifts the block and wakes the owner. The unblock hash must be on disk now.
+    const firstStatus = await runSync();
+    assert.notEqual(firstStatus, 'blocked');
+    assert.equal(statusUpdates.length, 1);
+    const firstRecord = readRecord();
+    assert.match(String(firstRecord?.unblockedExternalStateHash ?? ''), /^[a-f0-9]{64}$/);
+    const recordedFields = Object.keys(firstRecord ?? {}).sort();
+
+    // The agent blocks again with GitHub unchanged: the block holds on this and the next pass.
+    await originalUpdate(issue.id, { status: 'blocked' }, 'company-1');
+    statusUpdates.length = 0;
+    assert.equal(await runSync(), 'blocked');
+    assert.equal(await runSync(), 'blocked');
+    assert.equal(statusUpdates.length, 0);
+    assert.deepEqual(Object.keys(readRecord() ?? {}).sort(), recordedFields);
+
+    // A new head commit is new GitHub state, so routing resumes even with the same CI result.
+    headSha = 'd'.repeat(40);
+    assert.notEqual(await runSync(), 'blocked');
+    assert.equal(statusUpdates.length, 1);
+  } finally {
+    harness.ctx.issues.update = originalUpdate;
+    globalThis.fetch = originalFetch;
   }
 });
