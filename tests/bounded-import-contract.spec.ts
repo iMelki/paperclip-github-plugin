@@ -103,6 +103,10 @@ test('outer guard detects a forbidden mutation even when its request error is sw
     method: 'POST', body: JSON.stringify({ query: 'mutation Forbidden { noop }', variables: {} }),
   }).catch(() => undefined);
   assert.equal(violations.length, 1);
+  // The proof runner deliberately lets this assertion escape to verify CLI exit status.
+  if (process.env.PAPERCLIP_IMPORT_CONTRACT_NEGATIVE_PROOF === '1') {
+    assertNoForbiddenAttempts(violations);
+  }
   assert.throws(() => assertNoForbiddenAttempts(violations), /forbidden GitHub request attempt/);
 });
 
