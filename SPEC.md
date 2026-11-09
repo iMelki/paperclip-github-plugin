@@ -1,5 +1,50 @@
 # GitHub Sync plugin specification
 
+## Source-candidate recovery contract (2026-10-04; Paperclip #126)
+
+This section describes a source candidate, not installed behavior or complete qualification.
+The canonical interaction event MAY contain `externalPullRequestStateHash` only as a declared
+lowercase 64-hex digest. Invalid declared digests MUST fail sanitization; absent legacy values
+remain absent. Both registries MAY cache `unblockedExternalStateHash` and MUST validate it strictly.
+The canonical journal, not a mutable registry or current issue snapshot, owns recovery authority.
+
+Only a confirmed, scoped `sync/update_issue/changed` receipt with a blocked-to-nonblocked transition
+can earn a digest budget. It MUST be read back exactly before registry advancement or wake queueing.
+The hash uses upstream PR #211's eight structural fields, including review decision; direct PR
+snapshots add explicit open/closed/merged lifecycle. Entering blocked resets the budget; a later
+confirmed digestless unblock clears old budget; digestless or transitionless legacy rows earn none.
+The same-input deliberate reblock without a trusted comment MUST produce no assignment, comment
+or wake. This is an explicit exception to generic local-drift reconciliation. Human ownership MUST
+never be treated as permission to wake an agent. Missing canonical evidence for an established cached
+budget MUST hold, not erase that budget. Persisted budgets MUST bind their exact earning receipt key
+and digest; an older same-digest receipt MUST NOT substitute for a missing newer episode. A legacy
+digest-only budget MUST hold on differing/reset history until continuity is attributable.
+A mutation wake MUST bind its exact episode and expected-state
+hash to a changed receipt before effects; all wake admission/replay MUST verify that scoped receipt.
+Declared malformed binding/status fields MUST hold, never become legacy absence. Pure initial import
+activation retains its separate caller-scoped contract. Execution-metadata drift conservatively holds.
+
+Unsettled mutation/comment intents MUST hold across worker reload, action-family changes and
+registry-save failure. Generic SDK rejection MUST remain UNKNOWN, even when the issue now matches
+the desired patch; no error-code-only NOT_APPLIED classifier is permitted. An uncertain REST result
+MUST NOT trigger SDK fallback. Malformed/conflicting/truncated journals and ambiguous transition
+ordering MUST return an explicit hold. Compaction cannot silently discard unresolved effects or
+their settled attribution; qualification of that behavior remains pending.
+
+The candidate's focused and receipt-continuity suites are part of normal test registration.
+Twenty-eight focused/continuity cases and twelve selected actual-caller regressions passed with
+private Node 24.21.0, along with TypeScript 7
+no-emit checking and an isolated build. The selected regressions exercise both polling callers,
+saved-receipt readback, fresh-worker UNKNOWN cases, registry failure and manual reblocks. A direct
+caller partial-episode compaction case failed against the previous candidate, then passed after
+exact earning-receipt binding. These checks do
+not establish full caller coverage, human no-wake routing or all retention/compaction behavior.
+Textual source checks and output-field negative controls are not real source-mutant proof;
+hostile persisted wake-binding coverage and failing/restored real normalizer qualification remain
+required. A completed scoped sync failure MUST return the newly saved company state, not stale
+materialized settings that still report that sync as running.
+No SDK, runtime, manifest, version, toolbar, UI kit or live-instance change is part of this unit.
+
 GitHub Sync is a Paperclip plugin for registering one or more GitHub repositories and synchronizing their open issues into Paperclip projects.
 
 ## Repository registration

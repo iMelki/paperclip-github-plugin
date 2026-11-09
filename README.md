@@ -1,5 +1,55 @@
 # paperclip-github-plugin
 
+## Owned source candidate: durable external-PR waits (2026-10-04)
+
+Tracked by iMelki/paperclip#126; this uncommitted source candidate is **not installed or qualified**.
+It selectively reuses the Apache-2.0 structural predicates from upstream PR #211 at merge
+`d06bf866f5b80a949aa0127e755c3ef1c6df95f3`; no full plugin upgrade or new UI library is included.
+The eight upstream hash fields include `reviewDecision`; direct PR snapshots also declare lifecycle.
+The deliberate same-input blocked wait is an explicit exception to generic local-drift reconciliation.
+The canonical interaction schema declares an optional, strict lowercase 64-hex digest, rather than
+encoding it in a dedupe key, reason, external event ID, or undeclared field.
+
+Both imported-issue and direct-PR polling recover their unblock budget from scoped, complete,
+non-conflicting journal rows, not just a transient registry record. Only an acknowledged update and
+its exact saved `update_issue`/`changed` receipt can earn that budget. Receipt readback precedes
+registry advancement and wake queueing. A manual same-input reblock without a trusted follow-up
+comment is preserved. A later confirmed transition into blocked clears the budget; legacy rows
+without declared transition/digest data do not invent one. The registry digest is only a cache.
+A cached budget retains its exact earning receipt key as well as its digest. If that exact receipt
+disappears, recovery holds even when an older episode earned the same digest. A legacy digest-only
+cache holds when projected history differs or resets; it does not silently erase and re-arm the budget.
+A pending mutation wake is bound before effects to its exact episode, expected-state
+hash and changed receipt; snapshot coincidence or another episode's receipt cannot authorize it.
+Missing or malformed binding holds. Pure initial import activation retains its separate contract.
+Execution-metadata drift after the receipt conservatively holds rather than waking another owner.
+
+An intent, a failed result, and a matching current issue are not operation-attribution proof.
+Generic SDK rejection—including a commit followed by a thrown error—remains UNKNOWN and blocks
+repeat mutation/comment/wake after reload. No unsupported SDK error-code classifier is introduced.
+An uncertain REST PATCH does not fall through to a second SDK write. Incomplete scans, malformed
+rows, conflicting receipts, and ambiguous same-time transition ordering stop recovery explicitly.
+
+Qualification is partial: 28 focused/continuity cases and 12 selected actual-caller regressions passed on
+checksum-verified private Node 24.21.0. TypeScript 7 no-emit checking and an isolated build passed.
+The caller run covers imported and direct PR recovery, UNKNOWN outcomes, receipt-readback failures,
+registry-save failure and compacted-budget holds. A new direct-caller partial-episode compaction
+case failed against the previous candidate, then passed after exact earning-receipt binding.
+It also caught and repaired a scoped sync result
+that incorrectly reported a completed failure as still running. Full regression coverage, hostile
+wake-binding cases, human no-wake routing, source-mutant proof and final independent acceptance
+remain pending. This candidate has not been installed, synchronized, committed or published;
+no credentials were accessed.
+The focused suite is registered in the ordinary test command; ten existing PR/journal regression
+cases were relocated without changing their statements. Source negative controls are not observed
+gate-negative execution. These selected passes do not establish the full caller matrix or live
+delivery. Remaining acceptance includes human no-wake routing, hostile persisted wake bindings,
+complete compaction/truncation coverage and a real normalizer source-mutant/restored run.
+Existing long functions and retained legacy test callbacks remain review debt, not a waiver.
+
+Reusable lesson: persist a typed, attributable effect receipt before advancing resumable workflow
+state; acknowledgement, current-state coincidence and successful delivery are separate proofs.
+
 [![npm version](https://img.shields.io/npm/v/paperclip-github-plugin)](https://www.npmjs.com/package/paperclip-github-plugin)
 [![CI](https://img.shields.io/github/actions/workflow/status/alvarosanchez/paperclip-github-plugin/ci.yml?branch=main&label=CI)](https://github.com/alvarosanchez/paperclip-github-plugin/actions/workflows/ci.yml)
 [![Node >=24.11](https://img.shields.io/badge/node-%3E%3D24.11-339933?logo=node.js&logoColor=white)](https://www.npmjs.com/package/paperclip-github-plugin)

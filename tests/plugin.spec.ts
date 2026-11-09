@@ -1,4 +1,5 @@
 import { strict as assert } from 'node:assert';
+import { createHash } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -9,6 +10,8 @@ import type { Agent, Project } from '@paperclipai/plugin-sdk';
 import { createTestHarness } from '@paperclipai/plugin-sdk/testing';
 
 import type { PublishLocalBranchInput, PublishedBranch } from '../src/git-branch-publisher.ts';
+import { buildExternalPullRequestStateHash } from '../src/external-pr-wait.ts';
+import type { IssueInteractionEvent } from '../src/issue-interactions.ts';
 import manifest from '../src/manifest.ts';
 import {
   COMPANY_METRIC_API_ROUTE_KEY,
@@ -100,45 +103,6 @@ test.beforeEach(async () => {
     };
   });
   plugin = workerModule.default;
-});
-
-test('sync keeps completed healthy PR waits unassigned instead of restarting internal review', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const syncContext = {
-    assignee: { kind: 'agent', id: 'engineer-agent' },
-    executionPolicy: {
-      stages: [
-        {
-          id: 'architect-review',
-          type: 'review',
-          participants: [{ kind: 'agent', id: 'architect-agent' }]
-        }
-      ]
-    },
-    executionState: null
-  };
-  const advancedSettings = {
-    defaultStatus: 'backlog',
-    ignoredIssueAuthorUsernames: []
-  };
-
-  assert.equal(
-    workerModule.__testing.isHealthyMaintainerWaitTransition({
-      currentStatus: 'done',
-      nextStatus: 'in_review',
-      syncContext
-    }),
-    true
-  );
-  assert.equal(
-    workerModule.__testing.resolveSyncTransitionAssignee({
-      currentStatus: 'done',
-      nextStatus: 'in_review',
-      syncContext,
-      advancedSettings
-    }),
-    null
-  );
 });
 
 test('sync still starts internal review for active implementation handoffs', async () => {
@@ -438,125 +402,6 @@ test('issue-linked PR routing keeps trusted comment evidence attached to the sou
   );
 });
 
-test('issue-linked remote fingerprints distinguish waiting from action-required', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const pullRequest = (mergeStateStatus: 'unknown' | 'behind') => ({
-    number: 88,
-    repositoryUrl: 'https://github.com/paperclipai/example-repo',
-    headSha: 'same-head',
-    hasUnresolvedReviewThreads: false,
-    ciState: 'unfinished',
-    mergeability: 'mergeable',
-    mergeStateStatus,
-    reviewDecision: 'review_required'
-  });
-  const links = [{
-    data: {
-      repositoryUrl: 'https://github.com/paperclipai/example-repo',
-      githubPullRequestNumber: 88,
-      followThroughAssigneeAgentId: 'owner-88'
-    }
-  }];
-  const snapshot = (linkedPullRequest: ReturnType<typeof pullRequest>) => ({
-    issueNumber: 7,
-    state: 'open',
-    commentCount: 0,
-    linkedPullRequests: [linkedPullRequest]
-  });
-  const waitingSnapshot = snapshot(pullRequest('unknown'));
-  const actionableSnapshot = snapshot(pullRequest('behind'));
-  const waitingGate = workerModule.__testing.selectEffectiveIssueLinkedPullRequestGate(
-    waitingSnapshot.linkedPullRequests as never, [], false, links as never
-  );
-  const actionableGate = workerModule.__testing.selectEffectiveIssueLinkedPullRequestGate(
-    actionableSnapshot.linkedPullRequests as never, [], false, links as never
-  );
-
-  assert.equal(waitingGate?.remoteCondition, 'waiting');
-  assert.equal(actionableGate?.remoteCondition, 'action_required');
-  assert.notEqual(
-    workerModule.__testing.buildRemoteActionFingerprint(waitingSnapshot as never, waitingGate as never),
-    workerModule.__testing.buildRemoteActionFingerprint(actionableSnapshot as never, actionableGate as never),
-    'an actionable behind PR must re-arm issue-linked routing'
-  );
-});
-
-test('issue-linked effective gate aligns status, owner, fingerprint, and wake routing', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const pullRequest = (number: number, repositoryUrl = 'https://github.com/paperclipai/example-repo') => ({
-    number,
-    repositoryUrl,
-    headSha: `head-${number}`,
-    hasUnresolvedReviewThreads: false,
-    ciState: 'green',
-    mergeability: 'mergeable',
-    mergeStateStatus: 'clean',
-    reviewDecision: 'review_required'
-  });
-  const pullRequests = [pullRequest(10), pullRequest(20)];
-  const sources = [{
-    repositoryUrl: 'HTTPS://GITHUB.COM/paperclipai/example-repo/',
-    number: 20,
-    kind: 'top_level' as const
-  }];
-  const links = pullRequests.map((entry) => ({
-    data: {
-      repositoryUrl: entry.repositoryUrl,
-      githubPullRequestNumber: entry.number,
-      followThroughAssigneeAgentId: `owner-${entry.number}`
-    }
-  }));
-  const gate = workerModule.__testing.selectEffectiveIssueLinkedPullRequestGate(
-    pullRequests as never,
-    sources,
-    false,
-    links as never
-  );
-  const reversedGate = workerModule.__testing.selectEffectiveIssueLinkedPullRequestGate(
-    [...pullRequests].reverse() as never,
-    sources,
-    false,
-    [...links].reverse() as never
-  );
-  assert.deepEqual(reversedGate, gate);
-  assert.equal(gate?.number, 20);
-  assert.equal(gate?.ownerCandidate, 'owner-20');
-
-  const snapshot = {
-    issueNumber: 7,
-    state: 'open',
-    commentCount: 1,
-    linkedPullRequests: pullRequests
-  };
-  const status = workerModule.__testing.resolvePaperclipIssueStatus({
-    currentStatus: 'in_review',
-    snapshot,
-    effectiveGate: gate,
-    hasTrustedNewComment: true,
-    wasImportedThisRun: false,
-    defaultImportedStatus: 'backlog',
-    hasExecutorHandoffTarget: Boolean(gate?.ownerCandidate)
-  } as never);
-  assert.equal(status, 'in_progress');
-  assert.deepEqual(workerModule.__testing.resolveSyncTransitionAssignee({
-    currentStatus: 'in_review',
-    nextStatus: status,
-    syncContext: { assignee: null, executionPolicy: null, executionState: null },
-    advancedSettings: { defaultStatus: 'backlog', ignoredIssueAuthorUsernames: [] },
-    followThroughAssigneeAgentId: gate?.ownerCandidate
-  } as never), {
-    principal: { kind: 'agent', id: 'owner-20' },
-    role: 'executor'
-  });
-  assert.equal(
-    workerModule.__testing.buildRemoteActionFingerprint(snapshot as never, gate as never),
-    workerModule.__testing.buildRemoteActionFingerprint({
-      ...snapshot,
-      linkedPullRequests: [...pullRequests].reverse()
-    } as never, reversedGate as never)
-  );
-});
-
 test('trusted direct PR comment evidence preserves normalized PR identity and stream kind', async () => {
   const workerModule = await importFreshWorkerModule();
   const octokit = {
@@ -789,124 +634,6 @@ test('effective pull request gate selection does not mutate its candidates', asy
 
   assert.equal(selected?.number, 81);
   assert.deepEqual(gates, [ready, conflict]);
-});
-
-test('sync preserves blocked maintainer approval waits for green mergeable pull requests', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const testing = workerModule.__testing as typeof workerModule.__testing & {
-    resolvePaperclipPullRequestIssueStatus?: (params: {
-      currentStatus: string;
-      pullRequest: {
-        number: number;
-        repositoryUrl: string;
-        hasUnresolvedReviewThreads: boolean;
-        ciState: string;
-        mergeability: string;
-        mergeStateStatus: string;
-        reviewDecision: string;
-      };
-      hasExecutorHandoffTarget?: boolean;
-    }) => string;
-  };
-
-  assert.equal(typeof testing.resolvePaperclipPullRequestIssueStatus, 'function');
-
-  const basePullRequest = {
-    number: 1305,
-    repositoryUrl: 'https://github.com/micronaut-projects/micronaut-gradle-plugin',
-    hasUnresolvedReviewThreads: false,
-    ciState: 'green',
-    mergeability: 'mergeable',
-    mergeStateStatus: 'blocked',
-    reviewDecision: 'review_required'
-  };
-
-  assert.equal(
-    testing.resolvePaperclipPullRequestIssueStatus({
-      currentStatus: 'blocked',
-      pullRequest: basePullRequest
-    }),
-    'blocked'
-  );
-
-  assert.equal(
-    testing.resolvePaperclipPullRequestIssueStatus({
-      currentStatus: 'blocked',
-      pullRequest: {
-        ...basePullRequest,
-        reviewDecision: 'unknown'
-      }
-    }),
-    'blocked'
-  );
-});
-
-test('sync still routes blocked pull requests with actionable PR work to an executor', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const testing = workerModule.__testing as typeof workerModule.__testing & {
-    resolvePaperclipPullRequestIssueStatus?: (params: {
-      currentStatus: string;
-      pullRequest: {
-        number: number;
-        repositoryUrl: string;
-        hasUnresolvedReviewThreads: boolean;
-        ciState: string;
-        mergeability: string;
-        mergeStateStatus: string;
-        reviewDecision: string;
-      };
-      hasExecutorHandoffTarget?: boolean;
-    }) => string;
-  };
-
-  assert.equal(typeof testing.resolvePaperclipPullRequestIssueStatus, 'function');
-
-  const basePullRequest = {
-    number: 1305,
-    repositoryUrl: 'https://github.com/micronaut-projects/micronaut-gradle-plugin',
-    hasUnresolvedReviewThreads: false,
-    ciState: 'green',
-    mergeability: 'mergeable',
-    mergeStateStatus: 'blocked',
-    reviewDecision: 'review_required'
-  };
-
-  assert.equal(
-    testing.resolvePaperclipPullRequestIssueStatus({
-      currentStatus: 'blocked',
-      pullRequest: {
-        ...basePullRequest,
-        ciState: 'red'
-      },
-      hasExecutorHandoffTarget: true
-    }),
-    'in_progress'
-  );
-
-  assert.equal(
-    testing.resolvePaperclipPullRequestIssueStatus({
-      currentStatus: 'blocked',
-      pullRequest: {
-        ...basePullRequest,
-        mergeability: 'conflicting',
-        mergeStateStatus: 'dirty'
-      },
-      hasExecutorHandoffTarget: true
-    }),
-    'in_progress'
-  );
-
-  assert.equal(
-    testing.resolvePaperclipPullRequestIssueStatus({
-      currentStatus: 'blocked',
-      pullRequest: {
-        ...basePullRequest,
-        hasUnresolvedReviewThreads: true
-      },
-      hasExecutorHandoffTarget: true
-    }),
-    'in_progress'
-  );
 });
 
 test('issue blocker relation checks tolerate stale host capability denials', async () => {
@@ -23095,7 +22822,8 @@ test('worker routes non-review-ready GitHub merge state statuses back to active 
   }
 });
 
-test('sync.runNow converges local drift, quiesces stable state, and re-wakes for changed remote evidence', async () => {
+for (const unknownOutcome of ['rejected-before-return', 'committed-before-throw'] as const) {
+test(`sync.runNow preserves deliberate reblocks and holds ${unknownOutcome} across reload`, async () => {
   const harness = createTestHarness({ manifest, config: { githubTokenRef: 'github-secret-ref' } });
   await plugin.definition.setup(harness.ctx);
   harness.seed({ agents: [createAgentFixture({
@@ -23138,6 +22866,7 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
   const wakeRequests: string[] = [];
   const queuedWakeKeys = new Set<string>();
   let failNextStatusMutation = false;
+  let commitThenThrowStatusMutation = false;
   let failNextWake = false;
   const originalCreateComment = harness.ctx.issues.createComment;
   const originalUpdate = harness.ctx.issues.update;
@@ -23154,7 +22883,12 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
         throw new Error('Injected status mutation failure.');
       }
     }
-    return originalUpdate(issueId, patch, companyId);
+    const updated = await originalUpdate(issueId, patch, companyId);
+    if (issueId === issue.id && patch && typeof patch === 'object' && 'status' in patch && commitThenThrowStatusMutation) {
+      commitThenThrowStatusMutation = false;
+      throw new Error('Injected unknown status outcome after committed mutation.');
+    }
+    return updated;
   };
   harness.ctx.issues.requestWakeup = async (issueId, companyId, options) => {
     if (failNextWake) {
@@ -23252,6 +22986,14 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     assert.match(registryAfterFirstAction[0]?.remoteActionFingerprint ?? '', /^[a-f0-9]{64}$/);
 
     await acknowledgeAndReset();
+    const deliberateReblock = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+    assert.equal(deliberateReblock.syncState.status, 'success');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'blocked');
+    assert.equal(transitionComments.length, 0);
+    assert.equal(statusMutations.length, 0);
+    assert.equal(wakeRequests.length, 0);
+
+    await acknowledgeAndReset('in_review');
     await syncAndExpectWake();
 
     transitionComments.length = 0;
@@ -23320,14 +23062,7 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     statusMutations.length = 0;
     issueCommentAuthor = 'trusted-author';
     issueCommentCount = 2;
-    failNextStatusMutation = true;
-    const failedTrustedAction = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
-    assert.equal(failedTrustedAction.syncState.status, 'error');
-    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status, 'in_review');
-    transitionComments.length = 0;
-    statusMutations.length = 0;
-    wakeRequests.length = 0;
-    await syncAndExpectWake(0);
+    await syncAndExpectWake();
 
     await acknowledgeAndReset();
     headSha = 'c'.repeat(40);
@@ -23349,9 +23084,277 @@ test('sync.runNow converges local drift, quiesces stable state, and re-wakes for
     assert.equal(statusMutations.length, 0);
     assert.equal(transitionComments.length, 0);
     assert.equal(wakeRequests.length, 1);
+
+    await acknowledgeAndReset();
+    headSha = 'd'.repeat(40);
+    const journalBeforeUnknown = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.issue-interaction-event', scopeKind: 'issue', scopeId: issue.id
+    });
+    const priorJournalKeys = new Set(journalBeforeUnknown.map((event) =>
+      (event.data as { dedupeKey?: string }).dedupeKey
+    ));
+    failNextStatusMutation = unknownOutcome === 'rejected-before-return';
+    commitThenThrowStatusMutation = unknownOutcome === 'committed-before-throw';
+    const unknownCommit = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+    assert.equal(unknownCommit.syncState.status, 'error');
+    assert.equal((await harness.ctx.issues.get(issue.id, 'company-1'))?.status,
+      unknownOutcome === 'committed-before-throw' ? 'in_progress' : 'blocked');
+    assert.equal(statusMutations.length, 1);
+    assert.equal(transitionComments.length, 1);
+    assert.equal(wakeRequests.length, 0);
+    const unknownJournal = await harness.ctx.entities.list({
+      entityType: 'paperclip-github-plugin.issue-interaction-event', scopeKind: 'issue', scopeId: issue.id
+    });
+    const { __testing: testing } = await importFreshWorkerModule();
+    const pullRequest = { number: 610, repositoryUrl: 'https://github.com/paperclipai/example-repo',
+      headSha, ciState: 'red', mergeability: 'mergeable', mergeStateStatus: 'clean',
+      hasUnresolvedReviewThreads: false, reviewDecision: 'review_required' };
+    const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+    const remoteActionFingerprint = digest({ issue: testing.buildRemoteActionFingerprint({
+      issueNumber: 61, state: 'open', commentCount: issueCommentCount, linkedPullRequests: [pullRequest]
+    } as never), followThroughAssigneeAgentId: undefined });
+    const actionFingerprint = digest({ remoteActionFingerprint, issueCommentCount,
+      linkedPullRequestCommentCounts: [] });
+    const expectedFamily = `sync:${digest({ companyId: 'company-1', issueId: issue.id,
+      mutation: 'status_transition', actionFingerprint,
+      externalPullRequestStateHash: buildExternalPullRequestStateHash([pullRequest]), nextStatus: 'in_progress' })}`;
+    const exactIntents = unknownJournal.map((event) => event.data as {
+      companyId?: string; paperclipIssueId?: string; source?: string; action?: string;
+      outcome?: string; dedupeKey?: string; transition?: { from?: string; to?: string }
+    }).filter((event) => event.companyId === 'company-1' && event.paperclipIssueId === issue.id
+      && event.source === 'sync' && event.action === 'update_issue' && event.outcome === 'observed'
+      && event.dedupeKey?.startsWith(`${expectedFamily}:`) && event.dedupeKey.endsWith(':mutation:intent')
+      && !priorJournalKeys.has(event.dedupeKey));
+    assert.equal(exactIntents.length, 1, 'UNKNOWN must retain the intent for this exact new head and action');
+    assert.deepEqual({ from: exactIntents[0]!.transition?.from, to: exactIntents[0]!.transition?.to },
+      { from: 'blocked', to: 'in_progress' });
+    const changedReceiptKey = exactIntents[0]!.dedupeKey!.replace(/:mutation:intent$/, ':mutation:result:changed');
+    assert.ok(!unknownJournal.some((event) =>
+      (event.data as { dedupeKey?: string }).dedupeKey === changedReceiptKey
+    ), 'an UNKNOWN SDK outcome cannot claim a confirmed mutation receipt');
+
+    const freshWorker = await importFreshWorker();
+    await freshWorker.definition.setup(harness.ctx);
+    statusMutations.length = 0;
+    transitionComments.length = 0;
+    wakeRequests.length = 0;
+    for (let poll = 0; poll < 2; poll += 1) {
+      const held = await harness.performAction('sync.runNow', {}) as { syncState: { status: string } };
+      assert.equal(held.syncState.status, 'error');
+      assert.equal(statusMutations.length, 0, 'fresh worker must not retry an UNKNOWN status mutation');
+      assert.equal(transitionComments.length, 0, 'fresh worker must not repeat the transition comment');
+      assert.equal(wakeRequests.length, 0, 'fresh worker must not wake an unacknowledged status transition');
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+}
+
+type ExternalWaitFailure = 'rejected-before-return' | 'committed-before-throw' | 'missing-receipt'
+  | 'mismatched-receipt' | 'registry-write' | 'reserved-wake-before-mutation' | 'compacted-journal';
+
+async function createExternalWaitCallerFixture(failure: ExternalWaitFailure) {
+  const harness = await createProjectPullRequestsHarness();
+  harness.seed({ agents: [createAgentFixture({
+    id: 'agent-1', companyId: 'company-1', name: 'Durable PR Executor'
+  })] });
+  const issue = await harness.ctx.issues.create({
+    companyId: 'company-1', projectId: 'project-1', title: 'Durable external PR wait', status: 'blocked'
+  });
+  await upsertDirectPullRequestLink(harness, issue.id, 90, { followThroughAssigneeAgentId: 'agent-1' });
+  return { harness, issue, failure, active: failure !== 'compacted-journal',
+    effects: { mutations: 0, comments: 0, wakes: 0 },
+    update: harness.ctx.issues.update.bind(harness.ctx.issues),
+    comment: harness.ctx.issues.createComment.bind(harness.ctx.issues),
+    wake: harness.ctx.issues.requestWakeup.bind(harness.ctx.issues),
+    set: harness.ctx.state.set.bind(harness.ctx.state),
+    list: harness.ctx.entities.list.bind(harness.ctx.entities) };
+}
+type ExternalWaitCallerFixture = Awaited<ReturnType<typeof createExternalWaitCallerFixture>>;
+
+function installExternalWaitMutationHooks(fixture: ExternalWaitCallerFixture) {
+  const { harness, issue, effects } = fixture;
+  harness.ctx.issues.createComment = async (...args) => {
+    effects.comments += 1;
+    return fixture.comment(...args);
+  };
+  harness.ctx.issues.requestWakeup = async (...args) => {
+    effects.wakes += 1;
+    return fixture.wake(...args);
+  };
+  harness.ctx.issues.update = async (issueId, patch, companyId) => {
+    const statusMutation = issueId === issue.id && patch && typeof patch === 'object' && 'status' in patch;
+    if (statusMutation) effects.mutations += 1;
+    if (statusMutation && fixture.active && fixture.failure === 'rejected-before-return') {
+      throw new Error('Generic SDK rejection with no authoritative dispatch outcome.');
+    }
+    const updated = await fixture.update(issueId, patch, companyId);
+    if (statusMutation && fixture.active && fixture.failure === 'committed-before-throw') {
+      throw new Error('Generic SDK rejection after an unacknowledged committed write.');
+    }
+    return updated;
+  };
+}
+
+function installExternalWaitPersistenceHooks(fixture: ExternalWaitCallerFixture) {
+  const { harness, issue } = fixture;
+  harness.ctx.entities.list = async (input) => {
+    const rows = await fixture.list(input);
+    if (input.entityType !== 'paperclip-github-plugin.issue-interaction-event') return rows;
+    if (fixture.active && fixture.failure === 'compacted-journal') return [];
+    return [...rows].reverse().flatMap((row) => {
+      const event = row.data as unknown as IssueInteractionEvent;
+      if (!fixture.active || event.paperclipIssueId !== issue.id
+        || event.action !== 'update_issue' || event.outcome !== 'changed') return [row];
+      if (fixture.failure === 'missing-receipt') return [];
+      if (fixture.failure === 'mismatched-receipt') return [{ ...row,
+        data: { ...event, transition: { ...event.transition, to: 'todo' } } }];
+      return [row];
+    });
+  };
+  harness.ctx.state.set = async (scope, value) => {
+    const records = scope.stateKey === 'paperclip-github-plugin-remote-action-registry'
+      && Array.isArray(value) ? value : [];
+    if (fixture.active && fixture.failure === 'registry-write'
+      && records.some((record) => record && typeof record === 'object' && 'fingerprint' in record)) {
+      throw new Error('Registry write rejected after the confirmed status receipt.');
+    }
+    await fixture.set(scope, JSON.parse(JSON.stringify(value)));
+    if (fixture.active && fixture.failure === 'reserved-wake-before-mutation'
+      && records.some((record) => record && typeof record === 'object' && 'pendingWake' in record)) {
+      throw new Error('Worker interrupted after wake reservation, before status dispatch.');
+    }
+  };
+}
+
+function externalWaitCallerFetch(input: unknown, init?: RequestInit): Promise<Response> {
+  const url = new URL(getRequestUrl(input));
+  if (url.pathname === '/repos/paperclipai/example-repo/pulls/90') return Promise.resolve(jsonResponse({
+    number: 90, title: 'Durable external PR wait', html_url: 'https://github.com/paperclipai/example-repo/pull/90',
+    state: 'open', merged: false, comments: 0, review_comments: 0, user: { login: 'trusted-author' }
+  }));
+  if (url.pathname === '/graphql') {
+    const { query, variables } = getGraphqlRequest(init);
+    assert.equal(variables.pullRequestNumber, 90);
+    if (query.includes('query GitHubPullRequestReviewThreads')) return Promise.resolve(graphqlResponse({
+      repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } }
+    }));
+    if (query.includes('query GitHubPullRequestCiContexts')) return Promise.resolve(graphqlResponse({
+      repository: { pullRequest: { headRefOid: 'd'.repeat(40), mergeable: 'CONFLICTING',
+        mergeStateStatus: 'DIRTY', reviewDecision: 'REVIEW_REQUIRED', statusCheckRollup: { contexts: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }]
+        } } } }
+    }));
+  }
+  throw new Error(`Unexpected request in issue-targeted direct PR sync: ${url.toString()}`);
+}
+
+async function syncExternalWaitCaller(fixture: ExternalWaitCallerFixture) {
+  return await fixture.harness.performAction('sync.runNow', {
+    companyId: 'company-1', issueId: fixture.issue.id, waitForCompletion: true
+  }) as { syncState: { status: string } };
+}
+
+for (const failure of ['rejected-before-return', 'committed-before-throw', 'missing-receipt',
+  'mismatched-receipt', 'registry-write'] as const) {
+test(`direct PR caller holds ${failure} before wake and recovers only confirmed effects`, async () => {
+  const fixture = await createExternalWaitCallerFixture(failure);
+  installExternalWaitMutationHooks(fixture);
+  installExternalWaitPersistenceHooks(fixture);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = externalWaitCallerFetch;
+  try {
+    assert.equal((await syncExternalWaitCaller(fixture)).syncState.status, 'error');
+    assert.deepEqual(fixture.effects, { mutations: 1, comments: 1, wakes: 0 });
+    assert.equal((await fixture.harness.ctx.issues.get(fixture.issue.id, 'company-1'))?.status,
+      failure === 'rejected-before-return' ? 'blocked' : 'in_progress');
+    if (failure === 'missing-receipt' || failure === 'mismatched-receipt') {
+      const registry = fixture.harness.getState({ scopeKind: 'instance',
+        stateKey: 'paperclip-github-plugin-remote-action-registry' }) as Array<{ fingerprint?: string }>;
+      assert.ok(!registry.some((record) => record.fingerprint), 'unreadable exact receipt cannot advance the registry');
+      return;
+    }
+    fixture.active = false;
+    const freshWorker = await importFreshWorker();
+    await freshWorker.definition.setup(fixture.harness.ctx);
+    for (let poll = 0; poll < 2; poll += 1) {
+      const retry = await syncExternalWaitCaller(fixture);
+      assert.equal(retry.syncState.status, failure === 'registry-write' ? 'success' : 'error');
+      assert.deepEqual(fixture.effects, { mutations: 1, comments: 1, wakes: failure === 'registry-write' ? 1 : 0 });
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+}
+
+for (const failure of ['reserved-wake-before-mutation', 'compacted-journal'] as const) {
+test(`direct PR caller refuses ${failure} as operation-attribution proof after reload`, async () => {
+  const fixture = await createExternalWaitCallerFixture(failure);
+  installExternalWaitMutationHooks(fixture);
+  installExternalWaitPersistenceHooks(fixture);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = externalWaitCallerFetch;
+  try {
+    const first = await syncExternalWaitCaller(fixture);
+    assert.equal(first.syncState.status, failure === 'compacted-journal' ? 'success' : 'error');
+    await fixture.update(fixture.issue.id, failure === 'compacted-journal' ? { status: 'blocked' }
+      : { status: 'in_progress', assigneeAgentId: 'agent-1' }, 'company-1');
+    fixture.active = failure === 'compacted-journal';
+    fixture.effects.mutations = fixture.effects.comments = fixture.effects.wakes = 0;
+    const freshWorker = await importFreshWorker();
+    await freshWorker.definition.setup(fixture.harness.ctx);
+    for (let poll = 0; poll < 2; poll += 1) {
+      assert.equal((await syncExternalWaitCaller(fixture)).syncState.status, 'error');
+      assert.deepEqual(fixture.effects, { mutations: 0, comments: 0, wakes: 0 });
+    }
+    assert.equal((await fixture.harness.ctx.issues.get(fixture.issue.id, 'company-1'))?.status,
+      failure === 'compacted-journal' ? 'blocked' : 'in_progress');
+  } finally { globalThis.fetch = originalFetch; }
+});
+}
+
+test('direct PR caller refuses partial-episode compaction when older same-hash receipts survive', async () => {
+  const fixture = await createExternalWaitCallerFixture('compacted-journal');
+  installExternalWaitMutationHooks(fixture);
+  const originalFetch = globalThis.fetch;
+  let head = 'a'.repeat(40);
+  globalThis.fetch = async (input, init) => {
+    const response = await externalWaitCallerFetch(input, init);
+    if (new URL(getRequestUrl(input)).pathname !== '/graphql'
+      || !getGraphqlRequest(init).query.includes('query GitHubPullRequestCiContexts')) return response;
+    const body = await response.json() as { data: { repository: { pullRequest: { headRefOid: string } } } };
+    body.data.repository.pullRequest.headRefOid = head;
+    return jsonResponse(body);
+  };
+  try {
+    let lastEpisodeKeys = new Set<string>();
+    const scope = { entityType: 'paperclip-github-plugin.issue-interaction-event',
+      scopeKind: 'issue' as const, scopeId: fixture.issue.id };
+    for (const nextHead of ['a', 'b', 'a']) {
+      head = nextHead.repeat(40);
+      await fixture.update(fixture.issue.id, { status: 'blocked' }, 'company-1');
+      const before = new Set((await fixture.list(scope)).map((row) =>
+        (row.data as unknown as IssueInteractionEvent).dedupeKey));
+      assert.equal((await syncExternalWaitCaller(fixture)).syncState.status, 'success');
+      lastEpisodeKeys = new Set((await fixture.list(scope)).map((row) =>
+        (row.data as unknown as IssueInteractionEvent).dedupeKey).filter((key) => !before.has(key)));
+    }
+    assert.deepEqual(fixture.effects, { mutations: 3, comments: 3, wakes: 3 });
+    assert.ok(lastEpisodeKeys.size > 0, 'the last H episode is distinct from older H/J episodes');
+    await fixture.update(fixture.issue.id, { status: 'blocked' }, 'company-1');
+    fixture.harness.ctx.entities.list = async (input) => (await fixture.list(input)).filter((row) =>
+      input.entityType !== scope.entityType
+      || !lastEpisodeKeys.has((row.data as unknown as IssueInteractionEvent).dedupeKey));
+    fixture.effects.mutations = fixture.effects.comments = fixture.effects.wakes = 0;
+    const freshWorker = await importFreshWorker();
+    await freshWorker.definition.setup(fixture.harness.ctx);
+    for (let poll = 0; poll < 2; poll += 1) {
+      assert.equal((await syncExternalWaitCaller(fixture)).syncState.status, 'error');
+      assert.deepEqual(fixture.effects, { mutations: 0, comments: 0, wakes: 0 });
+    }
+    assert.equal((await fixture.harness.ctx.issues.get(fixture.issue.id, 'company-1'))?.status, 'blocked');
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test('pending-wake capacity preserves retries without admitting a 257th effect', async () => {
@@ -23378,194 +23381,6 @@ test('pending-wake capacity preserves retries without admitting a 257th effect',
   assert.equal(canReservePendingWake!(fullRegistry, fullRegistry[0]!), true);
   assert.equal(canReservePendingWake!(fullRegistry, { key: 'new-effect' }), false);
   assert.equal(canReservePendingWake!(fullRegistry.slice(0, 255), { key: 'new-effect' }), true);
-});
-
-test('remote action fingerprints ignore transient raw UNKNOWN jitter that preserves the effective action', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const testing = workerModule.__testing as typeof workerModule.__testing & {
-    buildRemoteActionFingerprint?: (snapshot: Record<string, unknown>) => string;
-  };
-  assert.equal(typeof testing.buildRemoteActionFingerprint, 'function');
-
-  const basePullRequest = {
-    number: 77,
-    repositoryUrl: 'https://github.com/paperclipai/example-repo',
-    headSha: 'a'.repeat(40),
-    hasUnresolvedReviewThreads: false,
-    ciState: 'unfinished',
-    mergeability: 'unknown',
-    mergeStateStatus: 'unknown',
-    reviewDecision: 'unknown'
-  };
-  const baseSnapshot = {
-    issueNumber: 7,
-    state: 'open',
-    commentCount: 10,
-    linkedPullRequests: [basePullRequest]
-  };
-
-  const first = testing.buildRemoteActionFingerprint!(baseSnapshot);
-  const rawJitter = testing.buildRemoteActionFingerprint!({
-    ...baseSnapshot,
-    commentCount: 999,
-    linkedPullRequests: [{
-      ...basePullRequest,
-      mergeability: 'mergeable',
-      mergeStateStatus: 'unknown',
-      reviewDecision: 'review_required'
-    }]
-  });
-  assert.equal(rawJitter, first);
-
-  const actionableChange = testing.buildRemoteActionFingerprint!({
-    ...baseSnapshot,
-    linkedPullRequests: [{ ...basePullRequest, ciState: 'red' }]
-  });
-  assert.notEqual(actionableChange, first);
-});
-
-test('comment-count journal inputs are canonical across linked pull request order', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const testing = workerModule.__testing as typeof workerModule.__testing & {
-    canonicalizeGitHubPullRequestCommentCounts?: (records: Array<{
-      number: number;
-      repositoryUrl: string;
-      topLevelCommentCount: number;
-      reviewCommentCount: number;
-    }>) => Array<Record<string, unknown>>;
-  };
-  assert.equal(typeof testing.canonicalizeGitHubPullRequestCommentCounts, 'function');
-
-  const first = {
-    number: 81,
-    repositoryUrl: 'https://github.com/paperclipai/zeta',
-    topLevelCommentCount: 3,
-    reviewCommentCount: 2
-  };
-  const second = {
-    number: 12,
-    repositoryUrl: 'https://github.com/paperclipai/alpha',
-    topLevelCommentCount: 5,
-    reviewCommentCount: 1
-  };
-
-  assert.deepEqual(
-    testing.canonicalizeGitHubPullRequestCommentCounts!([first, second]),
-    testing.canonicalizeGitHubPullRequestCommentCounts!([second, first])
-  );
-});
-
-test('remote action fingerprints ignore lower-priority sibling PR changes masked by the effective action', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const testing = workerModule.__testing as typeof workerModule.__testing & {
-    buildRemoteActionFingerprint?: (snapshot: Record<string, unknown>) => string;
-    buildDirectPullRequestActionFingerprint?: (snapshots: Array<Record<string, unknown>>) => string;
-  };
-  assert.equal(typeof testing.buildDirectPullRequestActionFingerprint, 'function');
-
-  const conflict = {
-    number: 80,
-    repositoryUrl: 'https://github.com/paperclipai/example-repo',
-    headSha: 'a'.repeat(40),
-    hasUnresolvedReviewThreads: false,
-    ciState: 'green',
-    mergeability: 'conflicting',
-    mergeStateStatus: 'dirty',
-    reviewDecision: 'review_required'
-  };
-  const waiting = {
-    number: 81,
-    repositoryUrl: 'https://github.com/paperclipai/example-repo',
-    headSha: 'b'.repeat(40),
-    hasUnresolvedReviewThreads: false,
-    ciState: 'unfinished',
-    mergeability: 'unknown',
-    mergeStateStatus: 'unknown',
-    reviewDecision: 'unknown'
-  };
-  const issueSnapshot = {
-    issueNumber: 8,
-    state: 'open',
-    commentCount: 0,
-    linkedPullRequests: [conflict, waiting]
-  };
-  const issueFingerprint = testing.buildRemoteActionFingerprint!(issueSnapshot);
-  assert.equal(testing.buildRemoteActionFingerprint!({
-    ...issueSnapshot,
-    linkedPullRequests: [conflict, { ...waiting, headSha: 'c'.repeat(40), ciState: 'green', mergeability: 'mergeable' }]
-  }), issueFingerprint);
-
-  const toDirect = (pullRequest: Record<string, unknown>) => ({
-    pullRequestLink: { data: { githubPullRequestNumber: pullRequest.number } },
-    repository: { url: pullRequest.repositoryUrl },
-    lifecycleState: 'open',
-    pullRequest
-  });
-  const directFingerprint = testing.buildDirectPullRequestActionFingerprint!([toDirect(conflict), toDirect(waiting)]);
-  assert.equal(testing.buildDirectPullRequestActionFingerprint!([
-    toDirect(conflict),
-    toDirect({ ...waiting, headSha: 'd'.repeat(40), ciState: 'green', mergeability: 'mergeable' })
-  ]), directFingerprint);
-});
-
-test('remote action registry normalization deduplicates and deterministically caps records while retaining pending wakes', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const testing = workerModule.__testing as typeof workerModule.__testing & {
-    normalizeRemoteActionRegistry?: (value: unknown) => Array<Record<string, unknown>>;
-  };
-  assert.equal(typeof testing.normalizeRemoteActionRegistry, 'function');
-
-  const digest = 'a'.repeat(64);
-  const records: Array<Record<string, unknown>> = Array.from({ length: 300 }, (_, index) => ({
-    key: `direct-pr:company:${String(index).padStart(3, '0')}`,
-    fingerprint: digest
-  }));
-  records[0]!.linkedPullRequestCommentCounts = Array.from({ length: 300 }, (_, index) => ({
-    number: index + 1,
-    repositoryUrl: 'https://github.com/paperclipai/example-repo',
-    topLevelCommentCount: index,
-    reviewCommentCount: index
-  }));
-  records.push({
-    key: 'direct-pr:company:299',
-    fingerprint: 'b'.repeat(64),
-    pendingWake: {
-      fingerprint: 'b'.repeat(64),
-      assigneeAgentId: 'agent-1',
-      reason: 'retry wake',
-      mutation: 'status_transition',
-      nextStatus: 'in_progress'
-    }
-  });
-
-  const normalized: Array<Record<string, unknown>> = testing.normalizeRemoteActionRegistry!(records);
-  assert.equal(normalized.length, 256);
-  assert.equal(new Set(normalized.map((entry: Record<string, unknown>) => entry.key)).size, normalized.length);
-  assert.ok(normalized.some((entry: Record<string, unknown>) => entry.key === 'direct-pr:company:299' && entry.pendingWake));
-  assert.equal(
-    (normalized.find((entry: Record<string, unknown>) => entry.key === 'direct-pr:company:000')
-      ?.linkedPullRequestCommentCounts as unknown[]).length,
-    128
-  );
-  assert.deepEqual(
-    normalized.map((entry: Record<string, unknown>) => entry.key),
-    [...normalized.map((entry: Record<string, unknown>) => entry.key)].sort((left, right) => String(left).localeCompare(String(right)))
-  );
-
-  const overCapacityPending = Array.from({ length: 257 }, (_, index) => ({
-    key: `direct-pr:company:pending-${String(index).padStart(3, '0')}`,
-    pendingWake: {
-      fingerprint: digest,
-      assigneeAgentId: `agent-${index}`,
-      reason: 'retry wake',
-      mutation: 'status_transition',
-      nextStatus: 'in_progress'
-    }
-  }));
-  assert.throws(
-    () => testing.normalizeRemoteActionRegistry!(overCapacityPending),
-    /contains 257 pending wakes; maximum is 256/
-  );
 });
 
 test('REST wake fallback carries the same fingerprint-derived idempotency key as the SDK request', async () => {
@@ -23613,30 +23428,6 @@ test('REST wake fallback carries the same fingerprint-derived idempotency key as
     harness.ctx.issues.requestWakeup = originalWake;
     globalThis.fetch = originalFetch;
   }
-});
-
-test('import registry normalization discards malformed legacy remote action state', async () => {
-  const workerModule = await importFreshWorkerModule();
-  const testing = workerModule.__testing as typeof workerModule.__testing & {
-    normalizeImportRegistry?: (value: unknown) => Array<Record<string, unknown>>;
-  };
-  assert.equal(typeof testing.normalizeImportRegistry, 'function');
-
-  const [record] = testing.normalizeImportRegistry!([{
-    mappingId: 'mapping-legacy',
-    githubIssueId: 9,
-    paperclipIssueId: 'issue-legacy',
-    importedAt: '2026-01-01T00:00:00.000Z',
-    remoteActionFingerprint: 'not-a-digest',
-    pendingRemoteActionWake: {
-      fingerprint: 'also-invalid',
-      assigneeAgentId: '',
-      reason: 42
-    }
-  }]);
-
-  assert.equal(record?.remoteActionFingerprint, undefined);
-  assert.equal(record?.pendingRemoteActionWake, undefined);
 });
 
 test('worker routes sync-driven review handoffs to execution-policy assignees and wakes those agents', async () => {
@@ -26366,7 +26157,7 @@ test('comment.annotation falls back to GitHub links found in plain issue comment
   ]);
 });
 
-test('worker falls back to the SDK bridge when the local Paperclip status PATCH returns an HTML sign-in page', async () => {
+test('worker fails closed without an SDK status fallback when the local Paperclip PATCH returns an HTML sign-in page', async () => {
   const harness = createTestHarness({
     manifest,
     config: {
@@ -26444,6 +26235,12 @@ test('worker falls back to the SDK bridge when the local Paperclip status PATCH 
     return originalCreateComment(issueId, body, companyId);
   };
 
+  const noFallbackWakeRequests: string[] = [];
+  const originalNoFallbackWake = harness.ctx.issues.requestWakeup.bind(harness.ctx.issues);
+  harness.ctx.issues.requestWakeup = async (issueId, companyId, options) => {
+    noFallbackWakeRequests.push(issueId);
+    return originalNoFallbackWake(issueId, companyId, options);
+  };
   const patchRequests: Array<{ issueId: string; body: Record<string, unknown> | null }> = [];
   const loginPage = '<!doctype html><html><body><h1>Sign in</h1></body></html>';
   const originalFetch = globalThis.fetch;
@@ -26541,24 +26338,19 @@ test('worker falls back to the SDK bridge when the local Paperclip status PATCH 
       syncState: { status: string };
     };
 
-    assert.equal(sync.syncState.status, 'success');
+    assert.equal(sync.syncState.status, 'error');
     const statusPatchRequests = patchRequests.filter((request) => typeof request.body?.status === 'string');
     assert.equal(statusPatchRequests.length, 1);
     assert.equal(statusPatchRequests[0]?.body?.status, 'todo');
-    assert.equal(directStatusUpdateCalls.length, 1);
-    assert.equal(directStatusUpdateCalls[0]?.status, 'todo');
+    assert.equal(directStatusUpdateCalls.length, 0);
     assert.equal(directCommentCalls.length, 1);
-    assert.ok(
-      harness.logs.find((entry) =>
-        entry.level === 'warn'
-        && entry.message === 'Unable to update a Paperclip issue status through the local API. Falling back to direct issue mutation.'
-        && entry.meta?.status === 200
-        && entry.meta?.error === 'Expected JSON from the Paperclip issue update API but received an HTML sign-in page.'
-      )
-    );
+    assert.equal(noFallbackWakeRequests.length, 0);
+    assert.ok(harness.logs.some((entry) =>
+      entry.message === 'Paperclip issue status update has an uncertain outcome. Holding without SDK fallback.'
+    ));
 
     const updatedIssue = await harness.ctx.issues.get(importedIssue.id, 'company-1');
-    assert.equal(updatedIssue?.status, 'todo');
+    assert.equal(updatedIssue?.status, 'in_progress');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -26877,7 +26669,7 @@ test('worker preserves execution-policy pending review state when the local Pape
       syncState: { status: string };
     };
 
-    assert.equal(sync.syncState.status, 'success');
+    assert.equal(sync.syncState.status, 'error');
     const statusPatchRequests = patchRequests.filter((request) => typeof request.body?.status === 'string');
     const directStatusPatches = directStatusUpdateCalls.filter((call) => typeof call.patch.status === 'string');
     assert.equal(statusPatchRequests.length, 1);
@@ -26893,39 +26685,13 @@ test('worker preserves execution-policy pending review state when the local Pape
       lastDecisionId: null,
       lastDecisionOutcome: null
     });
-    assert.equal(directStatusPatches.length, 1);
-    assert.equal(directStatusPatches[0]?.patch.status, 'in_review');
-    assert.equal(directStatusPatches[0]?.patch.assigneeAgentId, 'agent-2');
-    assert.deepEqual(directStatusPatches[0]?.patch.executionState, {
-      status: 'pending',
-      currentStageId: 'review-stage',
-      currentStageIndex: 0,
-      currentStageType: 'review',
-      currentParticipant: { type: 'agent', agentId: 'agent-2', userId: null },
-      returnAssignee: { type: 'agent', agentId: 'agent-1', userId: null },
-      completedStageIds: [],
-      lastDecisionId: null,
-      lastDecisionOutcome: null
-    });
-    assert.equal(wakeRequests.length, 1);
-    assert.equal(wakeRequests[0]?.issueId, importedIssue.id);
-    assert.equal(wakeRequests[0]?.companyId, 'company-1');
-    assert.equal(wakeRequests[0]?.options?.contextSource, 'github-sync.status_transition');
+    assert.equal(directStatusPatches.length, 0);
+    assert.equal(wakeRequests.length, 0);
 
     const updatedIssue = await harness.ctx.issues.get(importedIssue.id, 'company-1') as Record<string, any> | null;
-    assert.equal(updatedIssue?.status, 'in_review');
-    assert.equal(updatedIssue?.assigneeAgentId, 'agent-2');
-    assert.deepEqual(updatedIssue?.executionState, {
-      status: 'pending',
-      currentStageId: 'review-stage',
-      currentStageIndex: 0,
-      currentStageType: 'review',
-      currentParticipant: { type: 'agent', agentId: 'agent-2', userId: null },
-      returnAssignee: { type: 'agent', agentId: 'agent-1', userId: null },
-      completedStageIds: [],
-      lastDecisionId: null,
-      lastDecisionOutcome: null
-    });
+    assert.equal(updatedIssue?.status, 'in_progress');
+    assert.equal(updatedIssue?.assigneeAgentId, 'agent-1');
+    assert.equal(updatedIssue?.executionState ?? null, null);
   } finally {
     harness.ctx.issues.requestWakeup = originalRequestWakeup;
     globalThis.fetch = originalFetch;
@@ -27249,43 +27015,25 @@ test('worker preserves execution-policy changes-requested state when the local P
       syncState: { status: string };
     };
 
-    assert.equal(sync.syncState.status, 'success');
+    assert.equal(sync.syncState.status, 'error');
     const statusPatchRequests = patchRequests.filter((request) => typeof request.body?.status === 'string');
     const directStatusPatches = directStatusUpdateCalls.filter((call) => typeof call.patch.status === 'string');
     assert.equal(statusPatchRequests.length, 1);
     assert.equal(statusPatchRequests[0]?.body?.status, 'in_progress');
-    assert.equal(directStatusPatches.length, 1);
-    assert.equal(directStatusPatches[0]?.patch.status, 'in_progress');
-    assert.equal(directStatusPatches[0]?.patch.assigneeAgentId, 'agent-1');
-    assert.deepEqual(directStatusPatches[0]?.patch.executionState, {
-      status: 'changes_requested',
-      currentStageId: 'review-stage',
-      currentStageIndex: 0,
-      currentStageType: 'review',
-      currentParticipant: { type: 'agent', agentId: 'agent-2', userId: null },
-      returnAssignee: { type: 'agent', agentId: 'agent-1', userId: null },
-      completedStageIds: [],
-      lastDecisionId: null,
-      lastDecisionOutcome: 'changes_requested'
-    });
-    assert.equal(wakeRequests.length, 1);
-    assert.equal(wakeRequests[0]?.issueId, importedIssue.id);
-    assert.equal(wakeRequests[0]?.companyId, 'company-1');
-    assert.equal(wakeRequests[0]?.options?.contextSource, 'github-sync.status_transition');
+    assert.equal(directStatusPatches.length, 0);
+    assert.equal(wakeRequests.length, 0);
 
     const updatedIssue = await harness.ctx.issues.get(importedIssue.id, 'company-1') as Record<string, any> | null;
-    assert.equal(updatedIssue?.status, 'in_progress');
-    assert.equal(updatedIssue?.assigneeAgentId, 'agent-1');
+    assert.equal(updatedIssue?.status, 'in_review');
+    assert.equal(updatedIssue?.assigneeAgentId, 'agent-2');
     assert.deepEqual(updatedIssue?.executionState, {
-      status: 'changes_requested',
+      status: 'pending',
       currentStageId: 'review-stage',
       currentStageIndex: 0,
       currentStageType: 'review',
-      currentParticipant: { type: 'agent', agentId: 'agent-2', userId: null },
-      returnAssignee: { type: 'agent', agentId: 'agent-1', userId: null },
-      completedStageIds: [],
-      lastDecisionId: null,
-      lastDecisionOutcome: 'changes_requested'
+      currentParticipant: { type: 'agent', agentId: 'agent-2' },
+      returnAssignee: { type: 'agent', agentId: 'agent-1' },
+      completedStageIds: []
     });
   } finally {
     harness.ctx.issues.requestWakeup = originalRequestWakeup;

@@ -61,6 +61,7 @@ export interface IssueInteractionEvent {
     reasonCode?: string;
   };
   outcome: IssueInteractionOutcome;
+  externalPullRequestStateHash?: string;
   durationMs?: number;
   dedupeKey: string;
 }
@@ -112,6 +113,12 @@ function isoTimestamp(value: unknown, label: string): string {
 }
 
 export function sanitizeIssueInteractionEvent(value: IssueInteractionEvent): IssueInteractionEvent {
+  if (value.externalPullRequestStateHash !== undefined
+    && (typeof value.externalPullRequestStateHash !== 'string'
+      || !/^[a-f0-9]{64}$/.test(value.externalPullRequestStateHash)
+      || value.source !== 'sync' || value.action !== 'update_issue' || value.outcome !== 'changed')) {
+    throw new Error('externalPullRequestStateHash requires a lowercase SHA-256 digest on a confirmed sync update receipt.');
+  }
   const source = SOURCES.has(value.source) ? value.source : undefined;
   const outcome = OUTCOMES.has(value.outcome) ? value.outcome : undefined;
   const category = ISSUE_INTERACTION_CATEGORIES.has(value.category) ? value.category as IssueInteractionCategory : undefined;
@@ -151,6 +158,9 @@ export function sanitizeIssueInteractionEvent(value: IssueInteractionEvent): Iss
     ...(remote && Object.values(remote).some((entry) => entry !== undefined) ? { remote } : {}),
     ...(transition && Object.values(transition).some(Boolean) ? { transition } : {}),
     outcome,
+    ...(value.externalPullRequestStateHash !== undefined
+      ? { externalPullRequestStateHash: value.externalPullRequestStateHash }
+      : {}),
     ...(Number.isFinite(value.durationMs) && (value.durationMs ?? -1) >= 0
       ? { durationMs: Math.round(value.durationMs as number) }
       : {}),
