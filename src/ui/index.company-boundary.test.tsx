@@ -151,7 +151,6 @@ async function mount(): Promise<Root> {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
-  console.log('mount-done', tokenInput()?.value ?? '<missing>');
   return root;
 }
 
