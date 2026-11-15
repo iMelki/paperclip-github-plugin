@@ -25,6 +25,10 @@ import {
   type PublishedBranch
 } from './git-branch-publisher.ts';
 import { parseRepositoryReference, type ParsedRepositoryReference } from './github-repo.ts';
+import { createProjectBoardActions } from './project-board-connection.ts';
+import { createProjectBoardSyncActions, type BoardImportInput } from './project-board-sync.ts';
+import { createNativeBoardImportHost, readBoardImportExclusions, isManualBoardOrigin } from './project-board-host.ts';
+import { createProjectBoardOAuth } from './project-board-oauth.ts';
 import {
   buildIssueInteractionSummary,
   ISSUE_INTERACTION_ENTITY_TYPE,
@@ -10786,6 +10790,7 @@ async function listImportedPaperclipIssuesForMapping(
     ) {
       continue;
     }
+    if (isManualBoardOrigin(await ctx.issues.get(record.paperclipIssueId, mapping.companyId))) continue;
 
     importedIssuesByGitHubUrl.set(record.data.githubIssueUrl, {
       id: record.paperclipIssueId,
@@ -10805,6 +10810,7 @@ async function listImportedPaperclipIssuesForMapping(
     }
 
     for (const issue of page) {
+      if (isManualBoardOrigin(issue)) continue;
       if (issue.projectId !== mapping.paperclipProjectId) {
         continue;
       }
@@ -12727,6 +12733,10 @@ async function wakePaperclipIssueAssignee(
   }
 ): Promise<boolean> {
   if (!params.assigneeAgentId) {
+    return false;
+  }
+
+  if (params.companyId && isManualBoardOrigin(await ctx.issues.get(params.paperclipIssueId, params.companyId))) {
     return false;
   }
 
@@ -14754,6 +14764,17 @@ async function ensurePaperclipIssueImported(
   skippedIssueIds: Set<number>,
   syncFailureContext: SyncFailureContext
 ): Promise<string> {
+  if (mapping.companyId) {
+    const exclusions = await readBoardImportExclusions(ctx.issues, mapping.companyId);
+    const sourceUrl = normalizeGitHubIssueHtmlUrl(issue.htmlUrl) ?? issue.htmlUrl;
+    if (exclusions.has(sourceUrl)) {
+      throw new Error('This GitHub issue is protected by manual board import; stock sync cannot enroll it.');
+    }
+    const registered = importRegistryByIssueId.get(issue.id);
+    if (registered && isManualBoardOrigin(await ctx.issues.get(registered.paperclipIssueId, mapping.companyId))) {
+      throw new Error('Stock sync cannot reconcile a manual board-imported task.');
+    }
+  }
   updateSyncFailureContext(syncFailureContext, {
     phase: 'importing_issue',
     repositoryUrl: mapping.repositoryUrl,
@@ -15131,6 +15152,8 @@ async function reconcileTransferredImportedIssues(
     }
 
     try {
+      if (params.sourceMapping.companyId && isManualBoardOrigin(
+        await ctx.issues.get(importedIssue.paperclipIssueId, params.sourceMapping.companyId))) continue;
       updateSyncFailureContext(params.syncFailureContext, {
         phase: 'evaluating_github_status',
         repositoryUrl: params.sourceRepository.url,
@@ -15283,6 +15306,7 @@ async function synchronizePaperclipIssueStatuses(
         }
 
         const paperclipIssue = await ctx.issues.get(importedIssue.paperclipIssueId, mapping.companyId);
+        if (isManualBoardOrigin(paperclipIssue)) continue;
         let descriptionUpdated = false;
         let currentDescription = paperclipIssue?.description;
         const warmedLinkedPullRequestNumbers = (linkedPullRequestsByIssueNumber.get(githubIssue.number) ?? []).map(
@@ -15894,6 +15918,7 @@ async function synchronizePaperclipPullRequestIssueStatuses(
   }> = [];
 
   for (const [paperclipIssueId, issuePullRequestLinks] of pullRequestLinkGroups.entries()) {
+    if (isManualBoardOrigin(await ctx.issues.get(paperclipIssueId, mappingCompanyId))) continue;
     const pullRequestSnapshots: GitHubDirectPullRequestSyncSnapshot[] = [];
     let groupHadFailure = false;
 
@@ -22158,7 +22183,9 @@ async function performSync(
         updateSyncFailureContext(failureContext, {
           phase: 'listing_github_issues'
         });
-        const allIssues = await listRepositoryIssuesForSyncTarget(
+        const manualBoardExclusions = companyId
+          ? await readBoardImportExclusions(ctx.issues, companyId) : new Set<string>();
+        const listedIssues = await listRepositoryIssuesForSyncTarget(
           octokit,
           repository,
           shouldLoadClosedIssues ? 'all' : 'open',
@@ -22177,6 +22204,8 @@ async function performSync(
             }
           }
         );
+        const allIssues = listedIssues.filter(issue =>
+          !manualBoardExclusions.has(normalizeGitHubIssueHtmlUrl(issue.htmlUrl) ?? issue.htmlUrl));
         updateSyncFailureContext(failureContext, {
           phase: 'building_import_plan'
         });
@@ -24949,6 +24978,32 @@ const plugin = definePlugin({
     pluginRuntimeContext = ctx;
     // A fresh worker must not inherit a previous process's tool-access probe results.
     clearAgentToolAccessSummaryCache();
+
+    const boardScope = (companyId: string, projectId: string) => ({
+      scopeKind: 'company' as const, scopeId: companyId, stateKey: `github-project-board:${projectId}`
+    });
+    const boardProjects = { getProject: (projectId: string, companyId: string) => ctx.projects.get(projectId, companyId) };
+    const boardOAuth = createProjectBoardOAuth(ctx.issues, boardProjects);
+    const boardReaders = {
+      getProject: boardProjects.getProject,
+      getGraphql: boardOAuth.getGraphql,
+    } satisfies Pick<import('./project-board-sync.ts').ProjectBoardSyncHost, 'getProject' | 'getGraphql'>;
+    const boardActions = createProjectBoardActions({
+      ...boardReaders,
+      getConnection: (companyId, projectId) => ctx.state.get(boardScope(companyId, projectId)),
+      setConnection: (companyId, projectId, value) => ctx.state.set(boardScope(companyId, projectId), value)
+    });
+    ctx.actions.register('project.board.preview', (input, context) => boardActions.preview(input, context));
+    ctx.actions.register('project.board.save', (input, context) => boardActions.save(input, context));
+    ctx.actions.register('project.board.get', (input, context) => boardActions.get(input, context));
+    ctx.actions.register('project.board.oauth.list', (input, context) => boardOAuth.list(input, context));
+    ctx.actions.register('project.board.oauth.bind', (input, context) => boardOAuth.bind(input, context));
+    ctx.actions.register('project.board.oauth.get', (input, context) => boardOAuth.get(input, context));
+    const boardSync = createProjectBoardSyncActions(createNativeBoardImportHost(ctx.issues, boardReaders));
+    ctx.actions.register('project.board.plan', (input, context) => boardSync.plan(input as BoardImportInput, context));
+    ctx.actions.register('project.board.import', (input, context) => boardSync.execute(input as BoardImportInput, context));
+    ctx.actions.register('project.board.result', (input, context) => boardSync.recover(
+      input as unknown as import('./project-board-sync.ts').BoardImportRecoveryInput, context));
 
     ctx.data.register('settings.registration', async (input) => {
       const record = input && typeof input === 'object' ? input as Record<string, unknown> : {};

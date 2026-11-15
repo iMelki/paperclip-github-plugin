@@ -77,6 +77,7 @@ function installBrowser() {
   }) as typeof fetch;
   target.__paperclipPluginBridge__ = {
     sdkUi: {
+      ProjectPicker: () => null,
       useHostContext: () => host,
       usePluginToast: () => (input: unknown) => {
         toastLog.push(input);
