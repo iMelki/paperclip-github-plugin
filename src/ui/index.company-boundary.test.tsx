@@ -17,6 +17,7 @@ const readyCompanies = new Set<string>();
 const settingsByCompany = new Map<string, SettingsRecord>();
 const actionLog: string[] = [];
 const httpLog: Array<{ method: string; url: string }> = [];
+const toastLog: unknown[] = [];
 
 function idleData(loading: boolean, data?: SettingsRecord) {
   return { data, loading, error: null, refresh };
@@ -77,7 +78,10 @@ function installBrowser() {
   target.__paperclipPluginBridge__ = {
     sdkUi: {
       useHostContext: () => host,
-      usePluginToast: () => () => undefined,
+      usePluginToast: () => (input: unknown) => {
+        toastLog.push(input);
+        return undefined;
+      },
       usePluginData: (key: string, params?: Record<string, unknown>) => {
         if (key !== 'settings.registration') {
           return idleData(false);
@@ -128,14 +132,18 @@ function resetHarness() {
   settingsByCompany.clear();
   actionLog.length = 0;
   httpLog.length = 0;
+  toastLog.length = 0;
   dom.window.document.getElementById('root')?.replaceChildren();
 }
 
 let settingsPage: (typeof import('./index.tsx'))['GitHubSyncSettingsPage'] | undefined;
+let useGuardedToast: (typeof import('./index.tsx'))['useMountGuardedToast'] | undefined;
 
 async function loadPage() {
   if (!settingsPage) {
-    settingsPage = (await import('./index.tsx')).GitHubSyncSettingsPage;
+    const mod = await import('./index.tsx');
+    settingsPage = mod.GitHubSyncSettingsPage;
+    useGuardedToast = mod.useMountGuardedToast;
   }
   return settingsPage;
 }
@@ -291,4 +299,31 @@ test('typed token is cleared after the fresh company B response', async () => {
   assert.equal(dom.window.document.body.textContent?.includes(TYPED_TOKEN), false);
   assertNoActions();
   root.unmount();
+});
+
+test('a toast raised after the page unmounted is dropped', async () => {
+  await loadPage();
+  const hook = useGuardedToast;
+  assert.ok(hook);
+  let toast: ReturnType<typeof hook> | undefined;
+  function Probe() {
+    toast = hook!();
+    return null;
+  }
+  const container = dom.window.document.getElementById('root');
+  assert.ok(container);
+  const root = createRoot(container);
+  await act(async () => {
+    root.render(<Probe />);
+  });
+  assert.ok(toast);
+  const liveToast = toast;
+  liveToast({ title: 'while mounted', tone: 'info' });
+  assert.equal(toastLog.length, 1, 'a mounted page can toast');
+
+  await act(async () => {
+    root.unmount();
+  });
+  liveToast({ title: 'company A finished after the switch', tone: 'success' });
+  assert.equal(toastLog.length, 1, 'an unmounted page cannot toast');
 });
