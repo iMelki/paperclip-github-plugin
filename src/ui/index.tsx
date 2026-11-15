@@ -11302,6 +11302,11 @@ export function GitHubSyncProjectPullRequestsPage(): React.JSX.Element {
 
 export function GitHubSyncSettingsPage(): React.JSX.Element {
   const hostContext = useHostContext();
+  return <GitHubSyncCompanySettingsPage key={hostContext.companyId ?? 'no-company'} />;
+}
+
+function GitHubSyncCompanySettingsPage(): React.JSX.Element {
+  const hostContext = useHostContext();
   const toast = usePluginToast();
   const pluginIdFromLocation = getPluginIdFromLocation();
   const settings = usePluginData<GitHubSyncSettings>(
