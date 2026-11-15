@@ -4,6 +4,7 @@ import type { BoardItem, ProjectPreview } from '../personal-projects.ts';
 import { parseProjectReference } from '../personal-projects.ts';
 import type { BoardImportPlan, BoardImportResult } from '../project-board-sync.ts';
 import type { GitHubProjectBinding, GitHubProjectConnectionOption } from '../project-board-oauth.ts';
+import { reconcileSubmission } from '../project-board-submission.ts';
 
 const PAGE_SIZE = 20;
 const MAX_SELECTED = 20;
@@ -365,7 +366,7 @@ export function GitHubProjectBoardConnection(): React.JSX.Element {
       }
       commit({ submission, result: null, plan: null });
       const result = checkedResult(await importAction({ ...input, planId: submission.planId }), submission);
-      const verified = { ...submission, reconciled: result.complete };
+      const verified = reconcileSubmission(submission, result);
       retainSubmission(verified);
       commit({ submission: verified, result,
         message: result.complete ? 'Saved tasks read back. Plan the selection again before a later sync.'
@@ -379,7 +380,7 @@ export function GitHubProjectBoardConnection(): React.JSX.Element {
     await requests.run(async commit => {
       const result = checkedResult(await resultAction({ companyId, projectId: submission.projectId,
         boardUrl: submission.boardUrl, operationIds: submission.operationIds }), submission, true);
-      const verified = { ...submission, reconciled: result.complete };
+      const verified = reconcileSubmission(submission, result);
       retainSubmission(verified);
       commit({ submission: verified, result, plan: null,
         message: result.complete ? 'Retained operation receipts read back. No import was retried.'

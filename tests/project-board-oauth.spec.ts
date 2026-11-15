@@ -16,16 +16,21 @@ const nullContexts = [
 ];
 const binding = { version: 1, companyId, projectId, boardUrl, connectionId, boardId: 'PVT_12',
   accountId: 42, login: 'example', boundByUserId: 'synthetic-operator', boundAt: '2026-10-13T00:00:00Z' };
-function fixture(overrides: Record<string, unknown> = {}) {
+type Project = { id: string; companyId: string } | null;
+const ownProject: Project = { id: projectId, companyId };
+function fixture(overrides: Record<string, unknown> = {}, project: Project = ownProject) {
   const calls: Record<string, unknown>[] = [];
+  const projectLookups: Array<[string, string]> = [];
   const responses: Record<string, unknown> = { readProjectBinding: binding, bindProjectBoard: binding,
     listProjectConnections: { companyId, projectId, connections: [{ connectionId, name: 'Synthetic native OAuth',
       accountId: 42, login: 'example', lastVerifiedAt: null }] },
     readProjectPage: { user: { projectV2: { id: 'PVT_12', url: boardUrl, title: 'Synthetic board',
       updatedAt: '2026-10-13T00:00:00Z', items: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
     ...overrides };
-  return { calls, actions: createProjectBoardOAuth({ importedBoard: async (request: Record<string, unknown>) => {
+  return { calls, projectLookups, actions: createProjectBoardOAuth({ importedBoard: async (request: Record<string, unknown>) => {
     calls.push(request); return responses[request.op as string];
+  } }, { getProject: async (lookedUpProject: string, lookedUpCompany: string) => {
+    projectLookups.push([lookedUpProject, lookedUpCompany]); return project;
   } }) };
 }
 test('explicit native options, binding save and readback return no credential values or task writes', async () => {
@@ -74,7 +79,7 @@ for (const invalid of [
   await assert.rejects(actions.list(invalid, context)); assert.equal(calls.length, 0);
 });
 test('older host and no binding fail closed without PAT or SDK task fallback', async () => {
-  await assert.rejects(createProjectBoardOAuth({}).getGraphql(companyId, projectId), /No PAT fallback/);
+  await assert.rejects(createProjectBoardOAuth({}, { getProject: async () => ownProject }).getGraphql(companyId, projectId), /No PAT fallback/);
   const { actions, calls } = fixture({ readProjectBinding: null });
   await assert.rejects(actions.getGraphql(companyId, projectId), /No PAT fallback/);
   assert.deepEqual(calls.map(call => call.op), ['readProjectBinding']);
@@ -90,7 +95,7 @@ test('unknown save outcome is redacted and never blindly retried', async () => {
   const calls: unknown[] = [];
   const actions = createProjectBoardOAuth({ importedBoard: async (request: unknown) => {
     calls.push(request); throw new Error('Bearer synthetic-secret');
-  } });
+  } }, { getProject: async () => ownProject });
   await assert.rejects(actions.bind(input, context), error => error instanceof Error
     && !error.message.includes('synthetic-secret') && error.message.includes('before retrying'));
   assert.equal(calls.length, 1);
@@ -126,4 +131,32 @@ test('options reject unexpected credential metadata', async () => {
   const { actions } = fixture({ listProjectConnections: { companyId, projectId,
     connections: [{ connectionId, name: 'Fixture', accountId: 42, login: 'example', lastVerifiedAt: null, token: 'no' }] } });
   await assert.rejects(actions.list(input, context));
+});
+
+const foreignProjects: Array<[string, Project]> = [
+  ['a project that does not exist', null],
+  ['a project owned by another company', { id: projectId, companyId: connectionId }],
+  ['a different project id', { id: connectionId, companyId }],
+];
+for (const operation of ['list', 'get', 'bind'] as const) {
+  for (const [name, project] of foreignProjects) {
+    test(`${operation} refuses ${name} before any native call`, async () => {
+      const { actions, calls, projectLookups } = fixture({}, project);
+      await assert.rejects(actions[operation](input, context), /does not belong to this company/);
+      assert.deepEqual(projectLookups, [[projectId, companyId]]);
+      assert.equal(calls.length, 0);
+    });
+  }
+  test(`${operation} refuses when the project lookup fails`, async () => {
+    const calls: unknown[] = [];
+    const actions = createProjectBoardOAuth({ importedBoard: async (request: unknown) => { calls.push(request); return null; } },
+      { getProject: async () => { throw new Error('synthetic lookup failure'); } });
+    await assert.rejects(actions[operation](input, context), /does not belong to this company/);
+    assert.equal(calls.length, 0);
+  });
+}
+test('an owned project is looked up with its company on every operation', async () => {
+  const { actions, projectLookups } = fixture();
+  await actions.list(input, context); await actions.get(input, context);
+  assert.deepEqual(projectLookups, [[projectId, companyId], [projectId, companyId]]);
 });

@@ -11,6 +11,10 @@ interface NativeClient {
   importedBoard?(input: { companyId: string; op: string; [key: string]: unknown }): Promise<unknown>;
 }
 interface Context { companyId: string | null; actor: { companyId: string | null; type?: string } }
+/** Resolves a Paperclip project inside a company; null when it does not exist there. */
+export interface ProjectOwnership {
+  getProject(projectId: string, companyId: string): Promise<{ id: string; companyId: string } | null>;
+}
 const record = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim() === value && value.length > 0;
@@ -33,17 +37,23 @@ export function checkedGitHubProjectBinding(value: unknown, companyId: string, p
 }
 
 /** The worker never resolves OAuth secrets or sends a bearer, query or caller URL to the host bridge. */
-export function createProjectBoardOAuth(client: unknown) {
+export function createProjectBoardOAuth(client: unknown, projects: ProjectOwnership) {
   const native = client as NativeClient;
   const call = async (companyId: string, op: string, args: Record<string, unknown>) => {
     if (typeof native.importedBoard !== 'function') throw new Error('Native GitHub board OAuth bridge is unavailable. No PAT fallback.');
     try { return await native.importedBoard({ companyId, op, ...args }); }
     catch { throw new Error('Native GitHub board OAuth request failed. Load the saved binding before retrying a save.'); }
   };
-  function scope(input: Record<string, unknown>, context: Context) {
+  /** Checks the signed-in operator's scope, then that the project belongs to that company, before any native call. */
+  async function scope(input: Record<string, unknown>, context: Context) {
     if (!uuid(input.companyId) || !uuid(input.projectId) || input.companyId !== context?.companyId
       || context.actor?.companyId !== input.companyId || context.actor?.type !== 'user') {
       throw new Error('A signed-in operator and matching company/project scope are required.');
+    }
+    let project: { id: string; companyId: string } | null = null;
+    try { project = await projects.getProject(input.projectId, input.companyId); } catch { project = null; }
+    if (!project || project.id !== input.projectId || project.companyId !== input.companyId) {
+      throw new Error('The destination project does not belong to this company.');
     }
     return { companyId: input.companyId, projectId: input.projectId };
   }
@@ -52,7 +62,7 @@ export function createProjectBoardOAuth(client: unknown) {
   }
   return {
     list: async (input: Record<string, unknown>, context: Context) => {
-      const target = scope(input, context), value = await call(target.companyId, 'listProjectConnections', { projectId: target.projectId });
+      const target = await scope(input, context), value = await call(target.companyId, 'listProjectConnections', { projectId: target.projectId });
       return checked<{ companyId: string; projectId: string; connections: GitHubProjectConnectionOption[] }>(value,
         record(value) && value.companyId === target.companyId && value.projectId === target.projectId
         && Array.isArray(value.connections) && value.connections.length <= 100
@@ -62,11 +72,11 @@ export function createProjectBoardOAuth(client: unknown) {
           && (item.lastVerifiedAt === null || (text(item.lastVerifiedAt) && Number.isFinite(Date.parse(item.lastVerifiedAt))))));
     },
     get: async (input: Record<string, unknown>, context: Context) => {
-      const target = scope(input, context);
+      const target = await scope(input, context);
       return get(target.companyId, target.projectId);
     },
     bind: async (input: Record<string, unknown>, context: Context) => {
-      const target = scope(input, context);
+      const target = await scope(input, context);
       const reference = parseProjectReference(input.boardUrl);
       if (!uuid(input.connectionId)) throw new Error('Explicitly select a native GitHub OAuth connection.');
       const saved = checkedGitHubProjectBinding(await call(target.companyId, 'bindProjectBoard', {

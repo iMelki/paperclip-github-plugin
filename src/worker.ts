@@ -24982,9 +24982,10 @@ const plugin = definePlugin({
     const boardScope = (companyId: string, projectId: string) => ({
       scopeKind: 'company' as const, scopeId: companyId, stateKey: `github-project-board:${projectId}`
     });
-    const boardOAuth = createProjectBoardOAuth(ctx.issues);
+    const boardProjects = { getProject: (projectId: string, companyId: string) => ctx.projects.get(projectId, companyId) };
+    const boardOAuth = createProjectBoardOAuth(ctx.issues, boardProjects);
     const boardReaders = {
-      getProject: (projectId, companyId) => ctx.projects.get(projectId, companyId),
+      getProject: boardProjects.getProject,
       getGraphql: boardOAuth.getGraphql,
     } satisfies Pick<import('./project-board-sync.ts').ProjectBoardSyncHost, 'getProject' | 'getGraphql'>;
     const boardActions = createProjectBoardActions({
