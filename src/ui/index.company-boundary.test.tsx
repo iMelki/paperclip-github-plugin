@@ -76,6 +76,7 @@ function installBrowser() {
   }) as typeof fetch;
   target.__paperclipPluginBridge__ = {
     sdkUi: {
+      ProjectPicker: () => null,
       useHostContext: () => host,
       usePluginToast: () => () => undefined,
       usePluginData: (key: string, params?: Record<string, unknown>) => {

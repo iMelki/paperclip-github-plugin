@@ -7,6 +7,25 @@
 
 GitHub Sync is a Paperclip plugin for teams that plan in Paperclip but still receive work through GitHub issues.
 
+### GitHub Projects connection and bounded import (private candidate)
+
+The GitHub Projects settings section accepts an existing personal or organization
+board URL and an existing Paperclip destination. Preview reads up to 1,000 board
+items, preserves supported fields as metadata, and explicitly identifies drafts,
+PRs, closed/archived and inaccessible items. A signed-in operator may save an
+independently read-back board association; this does not enable repository sync,
+task creation, assignment or wakeups. Load saved association recovers an unknown
+save result without blindly retrying. The private source candidate also adds
+explicit selection, import planning, task import and receipt-only recovery. Import
+fails closed unless the host and worker SDK expose the reviewed native atomic
+board-import protocol. It never falls back to ordinary issue creation. Personal boards require
+a Project-capable credential; repository-only fine-grained PATs are insufficient.
+
+The source candidate is not evidence of installation or live GitHub access.
+The browser OAuth Connect GitHub wizard and its server-owned credential bridge
+are still pending; the existing saved-secret path is not that wizard. Nothing
+connects, imports, schedules sync or starts an agent merely by opening settings.
+
 It connects GitHub repositories to Paperclip projects, imports open issues as top-level Paperclip issues, keeps those issues updated over time, and gives Paperclip agents first-class GitHub workflow tools for triage and delivery.
 
 ## Why teams use GitHub Sync
