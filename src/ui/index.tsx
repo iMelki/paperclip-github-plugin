@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   useHostContext,
   usePluginAction,
@@ -11300,6 +11300,31 @@ export function GitHubSyncProjectPullRequestsPage(): React.JSX.Element {
   );
 }
 
+/**
+ * Wraps the host toast so a result that arrives after the page unmounted (for
+ * example an action started under company A that settles after the host
+ * switched to company B) does not announce itself in the new company's view.
+ */
+export function useMountGuardedToast(): ReturnType<typeof usePluginToast> {
+  const rawToast = usePluginToast();
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  return useCallback(
+    ((input: Parameters<typeof rawToast>[0]) => {
+      if (!mountedRef.current) {
+        return undefined;
+      }
+      return rawToast(input);
+    }) as typeof rawToast,
+    [rawToast]
+  );
+}
+
 export function GitHubSyncSettingsPage(): React.JSX.Element {
   const hostContext = useHostContext();
   return <GitHubSyncCompanySettingsPage key={hostContext.companyId ?? 'no-company'} />;
@@ -11307,7 +11332,7 @@ export function GitHubSyncSettingsPage(): React.JSX.Element {
 
 function GitHubSyncCompanySettingsPage(): React.JSX.Element {
   const hostContext = useHostContext();
-  const toast = usePluginToast();
+  const toast = useMountGuardedToast();
   const pluginIdFromLocation = getPluginIdFromLocation();
   const settings = usePluginData<GitHubSyncSettings>(
     'settings.registration',
