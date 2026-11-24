@@ -19980,6 +19980,161 @@ test('worker surfaces an actionable sync error when the Paperclip label API retu
   }
 });
 
+async function runLabelCreateFailureSync(options: {
+  issueCount: number;
+  labelNames: string[];
+  createLabelResponse: (labelName: string) => Response;
+}) {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref',
+      paperclipApiBaseUrl: 'http://127.0.0.1:63675'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: { status: 'idle' },
+    paperclipApiBaseUrl: 'http://127.0.0.1:63675'
+  });
+
+  const originalFetch = globalThis.fetch;
+  const createAttempts: string[] = [];
+  const issueNumbers = Array.from({ length: options.issueCount }, (_, index) => 30 + index);
+
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    const method = typeof input === 'string' || input instanceof URL ? init?.method : input.method;
+
+    if (url.pathname === '/api/companies/company-1/labels') {
+      if (method === 'POST') {
+        const body = getJsonRequestBody(init);
+        const labelName = typeof body?.name === 'string' ? body.name : '';
+        createAttempts.push(labelName);
+        return options.createLabelResponse(labelName);
+      }
+      return jsonResponse([]);
+    }
+
+    if (url.pathname === '/api/companies/company-1/issues') {
+      const body = getJsonRequestBody(init);
+      const created = await harness.ctx.issues.create({
+        companyId: 'company-1',
+        projectId: 'project-1',
+        title: typeof body?.title === 'string' ? body.title : 'Imported',
+        description: typeof body?.description === 'string' ? body.description : undefined
+      } as Parameters<typeof harness.ctx.issues.create>[0]);
+      return jsonResponse(created, 201);
+    }
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse(
+        issueNumbers.map((number) => ({
+          id: number * 100,
+          number,
+          title: `Label failure issue ${number}`,
+          body: 'Body',
+          html_url: `https://github.com/paperclipai/example-repo/issues/${number}`,
+          state: 'open',
+          labels: options.labelNames.map((name) => ({ name, color: 'd73a4a' }))
+        }))
+      );
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse(issueNumbers.map((number) => ({ issueNumber: number })));
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber !== undefined) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: issueNumber,
+              state: 'OPEN',
+              stateReason: null,
+              comments: { totalCount: 0 },
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected request: ${url.toString()}`);
+  };
+
+  try {
+    await harness.performAction('sync.runNow', { waitForCompletion: true });
+    return { harness, createAttempts };
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test('worker stops the label phase for the run after the first 401 label create and logs one error', async () => {
+  const { harness, createAttempts } = await runLabelCreateFailureSync({
+    issueCount: 3,
+    labelNames: ['area:one', 'area:two', 'area:three', 'area:four', 'area:five'],
+    createLabelResponse: () => jsonResponse({ error: 'Board access required.' }, 401)
+  });
+
+  assert.equal(createAttempts.length, 1, `Expected one label create attempt, saw ${JSON.stringify(createAttempts)}`);
+
+  const createWarnings = harness.logs.filter(
+    (entry) => entry.level === 'warn' && entry.message === 'Unable to create a Paperclip label through the local API.'
+  );
+  assert.ok(createWarnings.length <= 1, `Expected at most one create warning, saw ${createWarnings.length}`);
+
+  const errorLogs = harness.logs.filter((entry) => entry.level === 'error');
+  assert.equal(errorLogs.length, 1, `Expected exactly one error log, saw ${errorLogs.length}`);
+  assert.match(errorLogs[0]?.message ?? '', /board access/i);
+  assert.match(errorLogs[0]?.message ?? '', /Worker Paperclip API URL/);
+
+  const skippedItemWarnings = harness.logs.filter(
+    (entry) => entry.level === 'warn' && entry.message === 'GitHub sync skipped a failed item and continued.'
+  );
+  assert.ok(skippedItemWarnings.length <= 1, `Expected at most one skipped-item warning, saw ${skippedItemWarnings.length}`);
+});
+
+test('worker keeps skipping and continuing when a label create fails with a non-auth error', async () => {
+  const { harness, createAttempts } = await runLabelCreateFailureSync({
+    issueCount: 1,
+    labelNames: ['area:one', 'area:two', 'area:three'],
+    createLabelResponse: (labelName) =>
+      labelName === 'area:one'
+        ? jsonResponse({ error: 'Internal error.' }, 500)
+        : jsonResponse({
+            id: `00000000-0000-0000-0000-00000000010${createAttempts.length}`,
+            companyId: 'company-1',
+            name: labelName,
+            color: '#d73a4a',
+            createdAt: '2026-04-09T10:05:00.000Z',
+            updatedAt: '2026-04-09T10:05:00.000Z'
+          })
+  });
+
+  // The first pass tries every label even though the first one failed with a 500. Later passes of the
+  // same run may retry, which is the existing behavior and is not asserted here.
+  assert.deepEqual(createAttempts.slice(0, 3), ['area:one', 'area:two', 'area:three']);
+  assert.equal(harness.logs.filter((entry) => entry.level === 'error').length, 0);
+});
+
 test('worker resyncs imported issue descriptions when the GitHub body changes later', async () => {
   const harness = createTestHarness({
     manifest,

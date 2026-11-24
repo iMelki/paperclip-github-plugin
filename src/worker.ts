@@ -244,18 +244,23 @@ interface PaperclipLabelLookupResult {
 interface ResolvedPaperclipLabelResult {
   label: PaperclipIssueLabel | null;
   failure?: PaperclipApiOperationFailure;
+  /** True when the label was skipped because the label phase is already blocked for this run. */
+  suppressed?: boolean;
 }
 
 interface PaperclipIssueLabelResolutionResult {
   labels: PaperclipIssueLabel[];
   unresolvedGitHubLabels: GitHubIssueLabelRecord[];
   failure?: PaperclipApiOperationFailure;
+  /** True when every unresolved label was skipped because the label phase is blocked for this run. */
+  failureSuppressed?: boolean;
 }
 
 interface PaperclipIssueCreateResult {
   id: string;
   unresolvedGitHubLabels: GitHubIssueLabelRecord[];
   labelResolutionFailure?: PaperclipApiOperationFailure;
+  labelResolutionSuppressed?: boolean;
 }
 
 interface RepositoryMapping {
@@ -13469,6 +13474,14 @@ async function createPaperclipLabelViaApi(
   }
 }
 
+// One run shares one label directory object, so blocking by directory scopes the block to a single run.
+// The next run builds a fresh directory and therefore tries again, once.
+const paperclipLabelPhaseAuthBlocks = new WeakMap<PaperclipLabelDirectory, PaperclipApiOperationFailure>();
+
+function isPaperclipApiAuthFailure(failure: PaperclipApiOperationFailure | undefined): boolean {
+  return Boolean(failure?.requiresAuthentication || failure?.status === 401 || failure?.status === 403);
+}
+
 async function ensurePaperclipLabelForGitHubLabel(
   ctx: PluginSetupContext,
   companyId: string,
@@ -13481,6 +13494,11 @@ async function ensurePaperclipLabelForGitHubLabel(
     return {
       label: matchedBeforeCreate
     };
+  }
+
+  const authBlock = paperclipLabelPhaseAuthBlocks.get(directory);
+  if (authBlock) {
+    return { label: null, failure: authBlock, suppressed: true };
   }
 
   const refreshedDirectoryBeforeCreate = await listPaperclipLabelsViaApi(ctx, companyId, paperclipApiBaseUrl);
@@ -13516,6 +13534,18 @@ async function ensurePaperclipLabelForGitHubLabel(
   }
 
   const failure = creationAttempt.failure ?? refreshedDirectory.failure ?? refreshedDirectoryBeforeCreate.failure;
+  if (isPaperclipApiAuthFailure(creationAttempt.failure)) {
+    paperclipLabelPhaseAuthBlocks.set(directory, creationAttempt.failure as PaperclipApiOperationFailure);
+    ctx.logger.error(
+      'Paperclip rejected the label create request as unauthenticated, so GitHub label mapping is stopped for the rest of this sync run. Connect Paperclip board access in plugin settings, or set Worker Paperclip API URL to a worker-accessible Paperclip API origin. The next sync run tries once more.',
+      {
+        companyId,
+        paperclipApiBaseUrl,
+        labelName: githubLabel.name,
+        status: creationAttempt.failure?.status
+      }
+    );
+  }
   if (failure?.status !== undefined || failure?.errorMessage) {
     logPaperclipLabelCreateFailure(ctx, {
       companyId,
@@ -13543,6 +13573,7 @@ async function ensurePaperclipLabelsForIssue(
   const unresolvedGitHubLabels: GitHubIssueLabelRecord[] = [];
   const seenIds = new Set<string>();
   let failure: PaperclipApiOperationFailure | undefined;
+  let allUnresolvedSuppressed = true;
 
   for (const githubLabel of issue.labels) {
     const resolution = await ensurePaperclipLabelForGitHubLabel(
@@ -13555,6 +13586,9 @@ async function ensurePaperclipLabelsForIssue(
 
     if (!resolution.label) {
       unresolvedGitHubLabels.push(githubLabel);
+      if (!resolution.suppressed) {
+        allUnresolvedSuppressed = false;
+      }
       failure ??= resolution.failure;
       continue;
     }
@@ -13570,7 +13604,8 @@ async function ensurePaperclipLabelsForIssue(
   return {
     labels: matchedLabels,
     unresolvedGitHubLabels,
-    ...(failure ? { failure } : {})
+    ...(failure ? { failure } : {}),
+    ...(unresolvedGitHubLabels.length > 0 && allUnresolvedSuppressed ? { failureSuppressed: true } : {})
   };
 }
 
@@ -13635,6 +13670,10 @@ async function synchronizePaperclipIssueLabels(
   );
 
   if (labelResolution.unresolvedGitHubLabels.length > 0) {
+    if (labelResolution.failureSuppressed) {
+      // The label phase already reported its one error for this run; leave this issue's labels alone.
+      return false;
+    }
     throw new PaperclipLabelSyncError({
       labelNames: labelResolution.unresolvedGitHubLabels.map((label) => label.name),
       paperclipApiBaseUrl,
@@ -14745,7 +14784,8 @@ async function createPaperclipIssue(
   return {
     id: ensuredCreatedIssueId,
     unresolvedGitHubLabels: labelResolution.unresolvedGitHubLabels,
-    ...(labelResolution.failure ? { labelResolutionFailure: labelResolution.failure } : {})
+    ...(labelResolution.failure ? { labelResolutionFailure: labelResolution.failure } : {}),
+    ...(labelResolution.failureSuppressed ? { labelResolutionSuppressed: true } : {})
   };
 }
 
@@ -14839,7 +14879,7 @@ async function ensurePaperclipIssueImported(
   ensuredPaperclipIssueIds.set(issue.id, createdIssue.id);
   createdIssueIds.add(issue.id);
 
-  if (createdIssue.unresolvedGitHubLabels.length > 0) {
+  if (createdIssue.unresolvedGitHubLabels.length > 0 && !createdIssue.labelResolutionSuppressed) {
     throw new PaperclipLabelSyncError({
       labelNames: createdIssue.unresolvedGitHubLabels.map((label) => label.name),
       paperclipApiBaseUrl,
