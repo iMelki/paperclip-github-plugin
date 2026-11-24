@@ -15479,17 +15479,26 @@ async function synchronizePaperclipIssueStatuses(
             repositoryUrl: repository.url,
             githubIssueNumber: githubIssue.number
           });
-          if (
-            await synchronizePaperclipIssueLabels(
-              ctx,
-              mapping.companyId,
-              paperclipIssue,
-              githubIssue,
-              availableLabels,
-              paperclipApiBaseUrl
-            )
-          ) {
-            updatedLabelsCount += 1;
+          try {
+            if (
+              await synchronizePaperclipIssueLabels(
+                ctx,
+                mapping.companyId,
+                paperclipIssue,
+                githubIssue,
+                availableLabels,
+                paperclipApiBaseUrl
+              )
+            ) {
+              updatedLabelsCount += 1;
+            }
+          } catch (error) {
+            if (!(error instanceof PaperclipLabelSyncError)) {
+              throw error;
+            }
+            // A label failure (including the blocked-run skip) is recorded and counted here, and the issue's labels
+            // stay as they are, but the issue still gets its description and status sync below.
+            recordRecoverableSyncFailure(ctx, failures, error, syncFailureContext);
           }
         }
 
