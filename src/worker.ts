@@ -13384,6 +13384,11 @@ async function buildPaperclipLabelDirectory(
 ): Promise<PaperclipLabelDirectory> {
   const directory: PaperclipLabelDirectory = new Map();
   const apiDirectory = await listPaperclipLabelsViaApi(ctx, companyId, paperclipApiBaseUrl);
+  noteLabelApiResult(ctx, directory, apiDirectory.failure, {
+    companyId,
+    paperclipApiBaseUrl,
+    step: 'initial label list'
+  });
   if (apiDirectory.directory) {
     mergePaperclipLabelDirectories(directory, apiDirectory.directory);
   }
@@ -13496,14 +13501,37 @@ function isPaperclipApiAuthFailure(failure: PaperclipApiOperationFailure | undef
   return Boolean(failure?.requiresAuthentication || failure?.status === 401 || failure?.status === 403);
 }
 
+/**
+ * The one place that turns a local label API result into a run block: call it with the result of EVERY
+ * label call (initial list, pre-create list, create, post-create list) before the result is used for anything
+ * else, so a denial blocks all further label writes for the company in this run.
+ */
+function noteLabelApiResult(
+  ctx: PluginSetupContext,
+  directory: PaperclipLabelDirectory,
+  failure: PaperclipApiOperationFailure | undefined,
+  params: {
+    companyId: string;
+    paperclipApiBaseUrl?: string;
+    labelName?: string;
+    step: 'initial label list' | 'label list' | 'label create';
+  }
+): boolean {
+  if (!failure || !isPaperclipApiAuthFailure(failure)) {
+    return false;
+  }
+  blockPaperclipLabelPhase(ctx, directory, { ...params, failure });
+  return true;
+}
+
 function blockPaperclipLabelPhase(
   ctx: PluginSetupContext,
   directory: PaperclipLabelDirectory,
   params: {
     companyId: string;
     paperclipApiBaseUrl?: string;
-    labelName: string;
-    step: 'label list' | 'label create';
+    labelName?: string;
+    step: 'initial label list' | 'label list' | 'label create';
     failure: PaperclipApiOperationFailure;
   }
 ): void {
@@ -13544,6 +13572,12 @@ async function ensurePaperclipLabelForGitHubLabel(
   }
 
   const refreshedDirectoryBeforeCreate = await listPaperclipLabelsViaApi(ctx, companyId, paperclipApiBaseUrl);
+  noteLabelApiResult(ctx, directory, refreshedDirectoryBeforeCreate.failure, {
+    companyId,
+    paperclipApiBaseUrl,
+    labelName: githubLabel.name,
+    step: 'label list'
+  });
   if (refreshedDirectoryBeforeCreate.directory) {
     mergePaperclipLabelDirectories(directory, refreshedDirectoryBeforeCreate.directory);
   }
@@ -13557,13 +13591,7 @@ async function ensurePaperclipLabelForGitHubLabel(
 
   if (refreshedDirectoryBeforeCreate.failure && isPaperclipApiAuthFailure(refreshedDirectoryBeforeCreate.failure)) {
     // The list call was rejected for access, so a create would be too: stop before sending it.
-    blockPaperclipLabelPhase(ctx, directory, {
-      companyId,
-      paperclipApiBaseUrl,
-      labelName: githubLabel.name,
-      step: 'label list',
-      failure: refreshedDirectoryBeforeCreate.failure
-    });
+    // (The block itself was already set right after the list call.)
     logPaperclipLabelCreateFailure(ctx, {
       companyId,
       paperclipApiBaseUrl,
@@ -13575,6 +13603,12 @@ async function ensurePaperclipLabelForGitHubLabel(
   }
 
   const creationAttempt = await createPaperclipLabelViaApi(ctx, companyId, githubLabel, paperclipApiBaseUrl);
+  noteLabelApiResult(ctx, directory, creationAttempt.failure, {
+    companyId,
+    paperclipApiBaseUrl,
+    labelName: githubLabel.name,
+    step: 'label create'
+  });
   if (creationAttempt.label) {
     addPaperclipLabelToDirectory(directory, creationAttempt.label);
     return {
@@ -13583,6 +13617,12 @@ async function ensurePaperclipLabelForGitHubLabel(
   }
 
   const refreshedDirectory = await listPaperclipLabelsViaApi(ctx, companyId, paperclipApiBaseUrl);
+  noteLabelApiResult(ctx, directory, refreshedDirectory.failure, {
+    companyId,
+    paperclipApiBaseUrl,
+    labelName: githubLabel.name,
+    step: 'label list'
+  });
   if (refreshedDirectory.directory) {
     mergePaperclipLabelDirectories(directory, refreshedDirectory.directory);
   }
@@ -13595,23 +13635,6 @@ async function ensurePaperclipLabelForGitHubLabel(
   }
 
   const failure = creationAttempt.failure ?? refreshedDirectory.failure ?? refreshedDirectoryBeforeCreate.failure;
-  if (creationAttempt.failure && isPaperclipApiAuthFailure(creationAttempt.failure)) {
-    blockPaperclipLabelPhase(ctx, directory, {
-      companyId,
-      paperclipApiBaseUrl,
-      labelName: githubLabel.name,
-      step: 'label create',
-      failure: creationAttempt.failure
-    });
-  } else if (refreshedDirectory.failure && isPaperclipApiAuthFailure(refreshedDirectory.failure)) {
-    blockPaperclipLabelPhase(ctx, directory, {
-      companyId,
-      paperclipApiBaseUrl,
-      labelName: githubLabel.name,
-      step: 'label list',
-      failure: refreshedDirectory.failure
-    });
-  }
   if (failure?.status !== undefined || failure?.errorMessage) {
     logPaperclipLabelCreateFailure(ctx, {
       companyId,
