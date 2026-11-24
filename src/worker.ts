@@ -772,11 +772,14 @@ class PaperclipLabelSyncError extends Error {
   readonly paperclipApiBaseUrl?: string;
   readonly requiresAuthentication: boolean;
   readonly labelNames: string[];
+  /** True when the label phase was already blocked for this run, so this issue only needs a counted failure, not another log line. */
+  readonly suppressed: boolean;
 
   constructor(params: {
     labelNames: string[];
     paperclipApiBaseUrl?: string;
     failure?: PaperclipApiOperationFailure;
+    suppressed?: boolean;
   }) {
     const labelNames = [...new Set(params.labelNames.map((value) => value.trim()).filter(Boolean))];
     const failure = params.failure;
@@ -810,6 +813,7 @@ class PaperclipLabelSyncError extends Error {
     this.paperclipApiBaseUrl = params.paperclipApiBaseUrl;
     this.requiresAuthentication = Boolean(failure?.requiresAuthentication);
     this.labelNames = labelNames;
+    this.suppressed = Boolean(params.suppressed);
   }
 }
 
@@ -5599,6 +5603,11 @@ function recordRecoverableSyncFailure(
     context: snapshot,
     occurredAt: new Date().toISOString()
   });
+
+  if (error instanceof PaperclipLabelSyncError && error.suppressed) {
+    // The one error for this run's label block was already logged. The failure stays recorded and counted.
+    return;
+  }
 
   ctx.logger.warn('GitHub sync skipped a failed item and continued.', {
     phase: snapshot.phase,
@@ -13474,12 +13483,41 @@ async function createPaperclipLabelViaApi(
   }
 }
 
-// One run shares one label directory object, so blocking by directory scopes the block to a single run.
-// The next run builds a fresh directory and therefore tries again, once.
+// A sync run builds one label directory per company and shares it across that company's issues, so
+// blocking by directory scopes the block to one run and one company. The next run builds a fresh
+// directory and therefore tries again, once.
 const paperclipLabelPhaseAuthBlocks = new WeakMap<PaperclipLabelDirectory, PaperclipApiOperationFailure>();
 
 function isPaperclipApiAuthFailure(failure: PaperclipApiOperationFailure | undefined): boolean {
   return Boolean(failure?.requiresAuthentication || failure?.status === 401 || failure?.status === 403);
+}
+
+function blockPaperclipLabelPhase(
+  ctx: PluginSetupContext,
+  directory: PaperclipLabelDirectory,
+  params: {
+    companyId: string;
+    paperclipApiBaseUrl?: string;
+    labelName: string;
+    step: 'label list' | 'label create';
+    failure: PaperclipApiOperationFailure;
+  }
+): void {
+  if (paperclipLabelPhaseAuthBlocks.has(directory)) {
+    return;
+  }
+
+  paperclipLabelPhaseAuthBlocks.set(directory, params.failure);
+  ctx.logger.error(
+    'Paperclip rejected the label request as unauthenticated or forbidden, so GitHub label mapping is stopped for the rest of this sync run. Connect Paperclip board access in plugin settings, or set Worker Paperclip API URL to a worker-accessible Paperclip API origin. Issues whose labels were skipped are counted as failed. The next sync run tries once more.',
+    {
+      companyId: params.companyId,
+      paperclipApiBaseUrl: params.paperclipApiBaseUrl,
+      labelName: params.labelName,
+      step: params.step,
+      status: params.failure.status
+    }
+  );
 }
 
 async function ensurePaperclipLabelForGitHubLabel(
@@ -13513,6 +13551,25 @@ async function ensurePaperclipLabelForGitHubLabel(
     };
   }
 
+  if (refreshedDirectoryBeforeCreate.failure && isPaperclipApiAuthFailure(refreshedDirectoryBeforeCreate.failure)) {
+    // The list call was rejected for access, so a create would be too: stop before sending it.
+    blockPaperclipLabelPhase(ctx, directory, {
+      companyId,
+      paperclipApiBaseUrl,
+      labelName: githubLabel.name,
+      step: 'label list',
+      failure: refreshedDirectoryBeforeCreate.failure
+    });
+    logPaperclipLabelCreateFailure(ctx, {
+      companyId,
+      paperclipApiBaseUrl,
+      labelName: githubLabel.name,
+      color: normalizeHexColor(githubLabel.color) ?? DEFAULT_PAPERCLIP_LABEL_COLOR,
+      failure: refreshedDirectoryBeforeCreate.failure
+    });
+    return { label: null, failure: refreshedDirectoryBeforeCreate.failure };
+  }
+
   const creationAttempt = await createPaperclipLabelViaApi(ctx, companyId, githubLabel, paperclipApiBaseUrl);
   if (creationAttempt.label) {
     addPaperclipLabelToDirectory(directory, creationAttempt.label);
@@ -13534,17 +13591,22 @@ async function ensurePaperclipLabelForGitHubLabel(
   }
 
   const failure = creationAttempt.failure ?? refreshedDirectory.failure ?? refreshedDirectoryBeforeCreate.failure;
-  if (isPaperclipApiAuthFailure(creationAttempt.failure)) {
-    paperclipLabelPhaseAuthBlocks.set(directory, creationAttempt.failure as PaperclipApiOperationFailure);
-    ctx.logger.error(
-      'Paperclip rejected the label create request as unauthenticated, so GitHub label mapping is stopped for the rest of this sync run. Connect Paperclip board access in plugin settings, or set Worker Paperclip API URL to a worker-accessible Paperclip API origin. The next sync run tries once more.',
-      {
-        companyId,
-        paperclipApiBaseUrl,
-        labelName: githubLabel.name,
-        status: creationAttempt.failure?.status
-      }
-    );
+  if (creationAttempt.failure && isPaperclipApiAuthFailure(creationAttempt.failure)) {
+    blockPaperclipLabelPhase(ctx, directory, {
+      companyId,
+      paperclipApiBaseUrl,
+      labelName: githubLabel.name,
+      step: 'label create',
+      failure: creationAttempt.failure
+    });
+  } else if (refreshedDirectory.failure && isPaperclipApiAuthFailure(refreshedDirectory.failure)) {
+    blockPaperclipLabelPhase(ctx, directory, {
+      companyId,
+      paperclipApiBaseUrl,
+      labelName: githubLabel.name,
+      step: 'label list',
+      failure: refreshedDirectory.failure
+    });
   }
   if (failure?.status !== undefined || failure?.errorMessage) {
     logPaperclipLabelCreateFailure(ctx, {
@@ -13661,6 +13723,21 @@ async function synchronizePaperclipIssueLabels(
   availableLabels: PaperclipLabelDirectory,
   paperclipApiBaseUrl?: string
 ): Promise<boolean> {
+  const blockBefore = paperclipLabelPhaseAuthBlocks.get(availableLabels);
+  if (blockBefore) {
+    // After the first access denial no label operation runs for the rest of the run: not even an update from
+    // cached labels, so an issue's existing labels are never replaced or cleared. The skip is counted as a failure.
+    if (githubIssue.labels.length === 0) {
+      return false;
+    }
+    throw new PaperclipLabelSyncError({
+      labelNames: githubIssue.labels.map((label) => label.name),
+      paperclipApiBaseUrl,
+      failure: blockBefore,
+      suppressed: true
+    });
+  }
+
   const labelResolution = await ensurePaperclipLabelsForIssue(
     ctx,
     companyId,
@@ -13669,15 +13746,15 @@ async function synchronizePaperclipIssueLabels(
     paperclipApiBaseUrl
   );
 
-  if (labelResolution.unresolvedGitHubLabels.length > 0) {
-    if (labelResolution.failureSuppressed) {
-      // The label phase already reported its one error for this run; leave this issue's labels alone.
-      return false;
-    }
+  if (labelResolution.unresolvedGitHubLabels.length > 0 || paperclipLabelPhaseAuthBlocks.has(availableLabels)) {
+    const unresolvedLabels = labelResolution.unresolvedGitHubLabels.length > 0
+      ? labelResolution.unresolvedGitHubLabels
+      : githubIssue.labels;
     throw new PaperclipLabelSyncError({
-      labelNames: labelResolution.unresolvedGitHubLabels.map((label) => label.name),
+      labelNames: unresolvedLabels.map((label) => label.name),
       paperclipApiBaseUrl,
-      failure: labelResolution.failure
+      failure: labelResolution.failure ?? paperclipLabelPhaseAuthBlocks.get(availableLabels),
+      suppressed: labelResolution.failureSuppressed
     });
   }
 
@@ -14767,6 +14844,16 @@ async function createPaperclipIssue(
     });
   }
 
+  const blockBefore = paperclipLabelPhaseAuthBlocks.get(availableLabels);
+  if (blockBefore && issue.labels.length > 0) {
+    return {
+      id: ensuredCreatedIssueId,
+      unresolvedGitHubLabels: [...issue.labels],
+      labelResolutionFailure: blockBefore,
+      labelResolutionSuppressed: true
+    };
+  }
+
   const labelResolution = await ensurePaperclipLabelsForIssue(
     ctx,
     mapping.companyId,
@@ -14774,12 +14861,14 @@ async function createPaperclipIssue(
     availableLabels,
     paperclipApiBaseUrl
   );
-  await applyPaperclipLabelsToIssue(
-    ctx,
-    mapping.companyId,
-    ensuredCreatedIssueId,
-    labelResolution.labels
-  );
+  if (!paperclipLabelPhaseAuthBlocks.has(availableLabels)) {
+    await applyPaperclipLabelsToIssue(
+      ctx,
+      mapping.companyId,
+      ensuredCreatedIssueId,
+      labelResolution.labels
+    );
+  }
 
   return {
     id: ensuredCreatedIssueId,
@@ -14879,11 +14968,12 @@ async function ensurePaperclipIssueImported(
   ensuredPaperclipIssueIds.set(issue.id, createdIssue.id);
   createdIssueIds.add(issue.id);
 
-  if (createdIssue.unresolvedGitHubLabels.length > 0 && !createdIssue.labelResolutionSuppressed) {
+  if (createdIssue.unresolvedGitHubLabels.length > 0) {
     throw new PaperclipLabelSyncError({
       labelNames: createdIssue.unresolvedGitHubLabels.map((label) => label.name),
       paperclipApiBaseUrl,
-      failure: createdIssue.labelResolutionFailure
+      failure: createdIssue.labelResolutionFailure,
+      suppressed: createdIssue.labelResolutionSuppressed
     });
   }
 
