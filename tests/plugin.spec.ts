@@ -19963,9 +19963,9 @@ test('worker surfaces an actionable sync error when the Paperclip label API retu
     assert.ok(
       harness.logs.find((entry) =>
         entry.level === 'warn'
-        && entry.message === 'Unable to create a Paperclip label through the local API.'
+        && entry.message === 'Unable to list Paperclip labels through the local API.'
         && entry.meta?.requiresAuthentication === true
-        && entry.meta?.error === 'Expected JSON from the Paperclip label create API but received an HTML sign-in page.'
+        && entry.meta?.error === 'Expected JSON from the Paperclip label list API but received an HTML sign-in page.'
       )
     );
 
@@ -19978,6 +19978,529 @@ test('worker surfaces an actionable sync error when the Paperclip label API retu
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+interface LabelSyncRunSummary {
+  syncState: {
+    status: string;
+    createdIssuesCount?: number;
+    erroredIssuesCount?: number;
+    recentFailures?: Array<{ phase?: string; githubIssueNumber?: number }>;
+  };
+}
+
+async function runLabelCreateFailureSync(options: {
+  issueCount: number;
+  labelNames: string[] | ((run: number, issueNumber: number) => string[]);
+  createLabelResponse: (labelName: string, run: number) => Response;
+  /** Called for every GET of the label list; the index counts every list request, starting at 1. */
+  listLabelsResponse?: (listRequestIndex: number, run: number) => Response;
+  runs?: number;
+  /** GitHub state of an issue in a run; defaults to open. */
+  issueState?: (run: number, issueNumber: number) => 'open' | 'closed';
+  onHarness?: (harness: ReturnType<typeof createTestHarness>) => void;
+  afterRun?: (run: number) => void;
+}) {
+  const harness = createTestHarness({
+    manifest,
+    config: {
+      githubTokenRef: 'github-secret-ref',
+      paperclipApiBaseUrl: 'http://127.0.0.1:63675'
+    }
+  });
+  await plugin.definition.setup(harness.ctx);
+  options.onHarness?.(harness);
+  await harness.performAction('settings.saveRegistration', {
+    mappings: [
+      {
+        id: 'mapping-a',
+        repositoryUrl: 'paperclipai/example-repo',
+        paperclipProjectName: 'Engineering',
+        paperclipProjectId: 'project-1',
+        companyId: 'company-1'
+      }
+    ],
+    syncState: { status: 'idle' },
+    paperclipApiBaseUrl: 'http://127.0.0.1:63675'
+  });
+
+  const originalFetch = globalThis.fetch;
+  const createAttempts: string[] = [];
+  let listRequests = 0;
+  let currentRun = 0;
+  const issueNumbers = Array.from({ length: options.issueCount }, (_, index) => 30 + index);
+
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(getRequestUrl(input));
+    const method = typeof input === 'string' || input instanceof URL ? init?.method : input.method;
+
+    if (url.pathname === '/api/companies/company-1/labels') {
+      if (method === 'POST') {
+        const body = getJsonRequestBody(init);
+        const labelName = typeof body?.name === 'string' ? body.name : '';
+        createAttempts.push(labelName);
+        return options.createLabelResponse(labelName, currentRun);
+      }
+      listRequests += 1;
+      return options.listLabelsResponse ? options.listLabelsResponse(listRequests, currentRun) : jsonResponse([]);
+    }
+
+    if (url.pathname === '/api/companies/company-1/issues') {
+      const body = getJsonRequestBody(init);
+      const created = await harness.ctx.issues.create({
+        companyId: 'company-1',
+        projectId: 'project-1',
+        title: typeof body?.title === 'string' ? body.title : 'Imported',
+        description: typeof body?.description === 'string' ? body.description : undefined
+      } as Parameters<typeof harness.ctx.issues.create>[0]);
+      return jsonResponse(created, 201);
+    }
+
+    if (url.pathname === '/repos/paperclipai/example-repo/issues' && ['all', 'open'].includes(url.searchParams.get('state') ?? '')) {
+      return jsonResponse(
+        issueNumbers.map((number) => ({
+          id: number * 100,
+          number,
+          title: `Label failure issue ${number}`,
+          body: 'Body',
+          html_url: `https://github.com/paperclipai/example-repo/issues/${number}`,
+          state: options.issueState?.(currentRun, number) ?? 'open',
+          labels: (typeof options.labelNames === 'function' ? options.labelNames(currentRun, number) : options.labelNames).map(
+            (name) => ({ name, color: 'd73a4a' })
+          )
+        }))
+      );
+    }
+
+    if (url.pathname === '/graphql') {
+      const { query, variables } = getGraphqlRequest(init);
+      const issueNumber = typeof variables.issueNumber === 'number' ? variables.issueNumber : undefined;
+
+      if (query.includes('query GitHubIssueParentRelationships')) {
+        return graphqlIssueParentRelationshipsResponse(issueNumbers.map((number) => ({ issueNumber: number })));
+      }
+
+      if (query.includes('query GitHubIssueStatusSnapshot') && issueNumber !== undefined) {
+        return graphqlResponse({
+          repository: {
+            issue: {
+              number: issueNumber,
+              state: options.issueState?.(currentRun, issueNumber) === 'closed' ? 'CLOSED' : 'OPEN',
+              stateReason: options.issueState?.(currentRun, issueNumber) === 'closed' ? 'COMPLETED' : null,
+              comments: { totalCount: 0 },
+              closedByPullRequestsReferences: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: []
+              }
+            }
+          }
+        });
+      }
+    }
+
+    throw new Error(`Unexpected request: ${url.toString()}`);
+  };
+
+  const syncs: LabelSyncRunSummary[] = [];
+  const attemptsAfterRun: number[] = [];
+  const errorLogsAfterRun: number[] = [];
+  try {
+    for (let run = 0; run < (options.runs ?? 1); run++) {
+      currentRun = run;
+      syncs.push(
+        (await harness.performAction('sync.runNow', { waitForCompletion: true })) as LabelSyncRunSummary
+      );
+      attemptsAfterRun.push(createAttempts.length);
+      errorLogsAfterRun.push(harness.logs.filter((entry) => entry.level === 'error').length);
+      options.afterRun?.(run);
+    }
+    return {
+      harness,
+      createAttempts,
+      listRequests: () => listRequests,
+      syncs,
+      attemptsAfterRun,
+      errorLogsAfterRun,
+      issueNumbers
+    };
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+function labelErrorLogs(harness: { logs: Array<{ level: string; message: string }> }) {
+  return harness.logs.filter((entry) => entry.level === 'error');
+}
+
+test('worker stops the label phase for the run after the first 401 label create and logs one error', async () => {
+  const { harness, createAttempts, syncs, issueNumbers } = await runLabelCreateFailureSync({
+    issueCount: 3,
+    labelNames: ['area:one', 'area:two', 'area:three', 'area:four', 'area:five'],
+    createLabelResponse: () => jsonResponse({ error: 'Board access required.' }, 401)
+  });
+
+  assert.equal(createAttempts.length, 1, `Expected one label create attempt, saw ${JSON.stringify(createAttempts)}`);
+
+  const createWarnings = harness.logs.filter(
+    (entry) => entry.level === 'warn' && entry.message === 'Unable to create a Paperclip label through the local API.'
+  );
+  assert.ok(createWarnings.length <= 1, `Expected at most one create warning, saw ${createWarnings.length}`);
+
+  const errorLogs = labelErrorLogs(harness);
+  assert.equal(errorLogs.length, 1, `Expected exactly one error log, saw ${errorLogs.length}`);
+  assert.match(errorLogs[0]?.message ?? '', /unauthenticated or forbidden/i);
+  assert.match(errorLogs[0]?.message ?? '', /board access/i);
+  assert.match(errorLogs[0]?.message ?? '', /Worker Paperclip API URL/);
+
+  const skippedItemWarnings = harness.logs.filter(
+    (entry) => entry.level === 'warn' && entry.message === 'GitHub sync skipped a failed item and continued.'
+  );
+  assert.ok(skippedItemWarnings.length <= 1, `Expected at most one skipped-item warning, saw ${skippedItemWarnings.length}`);
+
+  // Every issue whose labels were skipped is counted as failed, never as a clean sync.
+  const summary = syncs[0]?.syncState;
+  assert.equal(summary?.status, 'error');
+  assert.ok((summary?.erroredIssuesCount ?? 0) >= issueNumbers.length);
+  assert.deepEqual(
+    [...new Set(summary?.recentFailures?.filter((entry) => entry.phase === 'syncing_labels').map((entry) => entry.githubIssueNumber))].sort(),
+    [...issueNumbers].sort()
+  );
+});
+
+test('worker still imports every issue after the label stop, and the next run retries once', async () => {
+  const { harness, createAttempts, syncs, attemptsAfterRun, errorLogsAfterRun, issueNumbers } =
+    await runLabelCreateFailureSync({
+      issueCount: 3,
+      labelNames: ['area:one', 'area:two'],
+      createLabelResponse: () => jsonResponse({ error: 'Board access required.' }, 401),
+      runs: 2
+    });
+
+  assert.equal(syncs[0]?.syncState.createdIssuesCount, issueNumbers.length);
+  const importedTitles = (await harness.ctx.issues.list({ companyId: 'company-1' })).map((issue) => issue.title);
+  for (const number of issueNumbers) {
+    assert.ok(importedTitles.includes(`Label failure issue ${number}`));
+  }
+  assert.deepEqual(attemptsAfterRun, [1, 2], `Expected one create attempt per run, saw ${JSON.stringify(createAttempts)}`);
+  assert.deepEqual(errorLogsAfterRun, [1, 2]);
+  assert.ok((syncs[1]?.syncState.erroredIssuesCount ?? 0) >= issueNumbers.length);
+});
+
+test('worker does not send a label create when the pre-create label list is rejected for access', async () => {
+  const { harness, createAttempts, listRequests } = await runLabelCreateFailureSync({
+    issueCount: 2,
+    labelNames: ['area:one', 'area:two', 'area:three'],
+    createLabelResponse: () => jsonResponse({ error: 'Internal error.' }, 500),
+    // Request 1 builds the run's label directory. Every later list request is rejected.
+    listLabelsResponse: (index) => (index === 1 ? jsonResponse([]) : jsonResponse({ error: 'Board access required.' }, 401))
+  });
+
+  assert.equal(createAttempts.length, 0, `Expected no create attempt, saw ${JSON.stringify(createAttempts)}`);
+  assert.equal(listRequests(), 2, 'Expected one directory build and one rejected pre-create list, then nothing');
+  assert.equal(labelErrorLogs(harness).length, 1);
+});
+
+test('worker blocks the label phase when the list after a failed create is rejected for access', async () => {
+  const { harness, createAttempts, syncs, issueNumbers } = await runLabelCreateFailureSync({
+    issueCount: 2,
+    labelNames: ['area:one', 'area:two', 'area:three'],
+    createLabelResponse: () => jsonResponse({ error: 'Internal error.' }, 500),
+    // Requests 1 and 2 (directory build, pre-create list) succeed; the list after the create is rejected.
+    listLabelsResponse: (index) => (index <= 2 ? jsonResponse([]) : jsonResponse({ error: 'Board access required.' }, 403))
+  });
+
+  assert.equal(createAttempts.length, 1, `Expected one create attempt, saw ${JSON.stringify(createAttempts)}`);
+  assert.equal(labelErrorLogs(harness).length, 1);
+  assert.ok((syncs[0]?.syncState.erroredIssuesCount ?? 0) >= issueNumbers.length);
+});
+
+test('worker reports stale labels as a failed sync, without touching them, while the label phase is blocked', async () => {
+  const keepLabel = {
+    id: '00000000-0000-0000-0000-0000000000b1',
+    companyId: 'company-1',
+    name: 'area:keep',
+    color: '#d73a4a',
+    createdAt: '2026-04-09T10:00:00.000Z',
+    updatedAt: '2026-04-09T10:00:00.000Z'
+  };
+  const otherLabel = { ...keepLabel, id: '00000000-0000-0000-0000-0000000000b2', name: 'area:other' };
+  const updates: Array<{ issueId: string; labelIds?: string[] }> = [];
+  const updatesAtRunEnd: number[] = [];
+
+  const run = await runLabelCreateFailureSync({
+    issueCount: 2,
+    // Run 0 imports both issues with two labels. In run 1 issue 30 asks for a missing label (denied create, which
+    // blocks the phase) and GitHub has removed every label from issue 31.
+    labelNames: (runIndex, number) =>
+      runIndex === 0 ? ['area:keep', 'area:other'] : number === 30 ? ['area:keep', 'area:other', 'area:new'] : [],
+    createLabelResponse: (labelName, runIndex) =>
+      runIndex === 0
+        ? jsonResponse(labelName === 'area:keep' ? keepLabel : otherLabel)
+        : jsonResponse({ error: 'Board access required.' }, 401),
+    listLabelsResponse: (_index, runIndex) => jsonResponse(runIndex === 0 ? [] : [keepLabel, otherLabel]),
+    runs: 2,
+    afterRun: (runIndex) => {
+      updatesAtRunEnd[runIndex] = updates.length;
+    },
+    onHarness: (harness) => {
+      const originalUpdate = harness.ctx.issues.update;
+      harness.ctx.issues.update = (async (issueId: string, patch: { labelIds?: string[] }, companyId: string) => {
+        updates.push({ issueId, labelIds: patch.labelIds });
+        return originalUpdate(issueId, patch as never, companyId);
+      }) as typeof harness.ctx.issues.update;
+    }
+  });
+
+  const issues = await run.harness.ctx.issues.list({ companyId: 'company-1' });
+  const staleIssue = issues.find((issue) => issue.title === 'Label failure issue 31');
+  assert.ok(staleIssue);
+  assert.deepEqual([...(staleIssue?.labelIds ?? [])].sort(), [keepLabel.id, otherLabel.id].sort());
+  assert.deepEqual(
+    updates.slice(updatesAtRunEnd[0] ?? 0).filter((entry) => entry.labelIds !== undefined),
+    []
+  );
+  const failedIssues = new Set(
+    run.syncs[1]?.syncState.recentFailures?.filter((entry) => entry.phase === 'syncing_labels').map((entry) => entry.githubIssueNumber)
+  );
+  assert.ok(failedIssues.has(31), 'Expected the stale-label issue to be reported as a failed label sync');
+  assert.equal(labelErrorLogs(run.harness).length, 1);
+});
+
+function makeLabel(id: string, name: string) {
+  return {
+    id: `00000000-0000-0000-0000-0000000000${id}`,
+    companyId: 'company-1',
+    name,
+    color: '#d73a4a',
+    createdAt: '2026-04-09T10:00:00.000Z',
+    updatedAt: '2026-04-09T10:00:00.000Z'
+  };
+}
+
+function trackLabelUpdates(updates: Array<{ issueId: string; labelIds?: string[]; status?: string }>) {
+  return (harness: { ctx: { issues: { update: (...args: never[]) => unknown } } }) => {
+    const issues = harness.ctx.issues as unknown as {
+      update: (issueId: string, patch: { labelIds?: string[]; status?: string }, companyId: string) => Promise<unknown>;
+    };
+    const originalUpdate = issues.update.bind(issues);
+    issues.update = async (issueId, patch, companyId) => {
+      updates.push({ issueId, labelIds: patch.labelIds, status: patch.status });
+      return originalUpdate(issueId, patch, companyId);
+    };
+  };
+}
+
+test('worker leaves stale labels untouched and counts the issue when the initial label list is rejected', async () => {
+  const keep = makeLabel('c1', 'area:keep');
+  const other = makeLabel('c2', 'area:other');
+  const updates: Array<{ issueId: string; labelIds?: string[] }> = [];
+  const updatesAtRunEnd: number[] = [];
+
+  const run = await runLabelCreateFailureSync({
+    issueCount: 2,
+    // Run 0 imports both issues with two labels. In run 1 the label list is rejected from the first request and
+    // GitHub has removed every label, so the SDK-derived directory must not be used to clear the Paperclip labels.
+    labelNames: (runIndex) => (runIndex === 0 ? ['area:keep', 'area:other'] : []),
+    createLabelResponse: (labelName) => jsonResponse(labelName === 'area:keep' ? keep : other),
+    listLabelsResponse: (_index, runIndex) =>
+      runIndex === 0 ? jsonResponse([]) : jsonResponse({ error: 'Board access required.' }, 401),
+    runs: 2,
+    afterRun: (runIndex) => {
+      updatesAtRunEnd[runIndex] = updates.length;
+    },
+    onHarness: trackLabelUpdates(updates) as never
+  });
+
+  const issues = await run.harness.ctx.issues.list({ companyId: 'company-1' });
+  assert.equal(issues.length, 2);
+  for (const issue of issues) {
+    assert.deepEqual([...(issue.labelIds ?? [])].sort(), [keep.id, other.id].sort(), `${issue.title} lost labels`);
+  }
+  assert.deepEqual(
+    updates.slice(updatesAtRunEnd[0] ?? 0).filter((entry) => entry.labelIds !== undefined),
+    []
+  );
+  const failed = new Set(
+    run.syncs[1]?.syncState.recentFailures?.filter((entry) => entry.phase === 'syncing_labels').map((entry) => entry.githubIssueNumber)
+  );
+  assert.deepEqual([...failed].sort(), [...run.issueNumbers].sort());
+  assert.equal(run.attemptsAfterRun[1], run.attemptsAfterRun[0], 'no create may be sent in the blocked run');
+  assert.equal(labelErrorLogs(run.harness).length, 1);
+});
+
+test('worker blocks the run on a denied create even when the refresh then finds the label', async () => {
+  const keep = makeLabel('d1', 'area:keep');
+  const added = makeLabel('d2', 'area:new');
+  const updates: Array<{ issueId: string; labelIds?: string[] }> = [];
+  const updatesAtRunEnd: number[] = [];
+  let lastRun = -1;
+  let runListCount = 0;
+
+  const run = await runLabelCreateFailureSync({
+    issueCount: 2,
+    // Run 1, issue 30 asks for a missing label: the create is denied, then the refresh finds the label anyway.
+    labelNames: (runIndex, number) =>
+      runIndex === 0 ? ['area:keep'] : number === 30 ? ['area:keep', 'area:new'] : ['area:keep'],
+    createLabelResponse: (_labelName, runIndex) =>
+      runIndex === 0 ? jsonResponse(keep) : jsonResponse({ error: 'Board access required.' }, 401),
+    listLabelsResponse: (_index, runIndex) => {
+      if (runIndex !== lastRun) {
+        lastRun = runIndex;
+        runListCount = 0;
+      }
+      runListCount += 1;
+      if (runIndex === 0) return jsonResponse([]);
+      // Run 1: the directory build and the pre-create list lack the label; the refresh after the denied create has it.
+      return jsonResponse(runListCount <= 2 ? [keep] : [keep, added]);
+    },
+    runs: 2,
+    afterRun: (runIndex) => {
+      updatesAtRunEnd[runIndex] = updates.length;
+    },
+    onHarness: trackLabelUpdates(updates) as never
+  });
+
+  assert.equal(run.attemptsAfterRun[1] - run.attemptsAfterRun[0], 1);
+  assert.equal(labelErrorLogs(run.harness).length, 1, 'one block error, in the denied run');
+  const issues = await run.harness.ctx.issues.list({ companyId: 'company-1' });
+  for (const issue of issues) {
+    assert.deepEqual(issue.labelIds, [keep.id], `${issue.title} must keep exactly its run-0 labels`);
+  }
+  assert.deepEqual(
+    updates.slice(updatesAtRunEnd[0] ?? 0).filter((entry) => entry.labelIds !== undefined),
+    [],
+    'no label update or assign after the denied create'
+  );
+  const failed = new Set(
+    run.syncs[1]?.syncState.recentFailures?.filter((entry) => entry.phase === 'syncing_labels').map((entry) => entry.githubIssueNumber)
+  );
+  assert.deepEqual([...failed].sort(), [...run.issueNumbers].sort());
+});
+
+test('worker still syncs status while labels are blocked, counting one failed label sync for the issue', async () => {
+  const keep = makeLabel('e1', 'area:keep');
+  const updates: Array<{ issueId: string; labelIds?: string[]; status?: string }> = [];
+  const updatesAtRunEnd: number[] = [];
+
+  const run = await runLabelCreateFailureSync({
+    issueCount: 2,
+    // Run 1: issue 30 asks for a missing label (denied create, which blocks the phase). Issue 31 keeps its existing
+    // label and is closed on GitHub, so its status must still change while its labels are left alone.
+    labelNames: (runIndex, number) =>
+      runIndex === 0 ? ['area:keep'] : number === 30 ? ['area:keep', 'area:new'] : ['area:keep'],
+    issueState: (runIndex, number) => (runIndex === 1 && number === 31 ? 'closed' : 'open'),
+    createLabelResponse: (_labelName, runIndex) =>
+      runIndex === 0 ? jsonResponse(keep) : jsonResponse({ error: 'Board access required.' }, 401),
+    listLabelsResponse: (_index, runIndex) => jsonResponse(runIndex === 0 ? [] : [keep]),
+    runs: 2,
+    afterRun: (runIndex) => {
+      updatesAtRunEnd[runIndex] = updates.length;
+    },
+    onHarness: trackLabelUpdates(updates) as never
+  });
+
+  const issues = await run.harness.ctx.issues.list({ companyId: 'company-1' });
+  const closedIssue = issues.find((issue) => issue.title === 'Label failure issue 31');
+  assert.ok(closedIssue);
+  assert.equal(closedIssue?.status, 'done', 'the GitHub state change must still reach the issue status');
+  assert.deepEqual(closedIssue?.labelIds, [keep.id], 'labels stay untouched');
+  assert.deepEqual(
+    updates.slice(updatesAtRunEnd[0] ?? 0).filter((entry) => entry.labelIds !== undefined),
+    [],
+    'no label update while blocked'
+  );
+  const failuresForClosedIssue = (run.syncs[1]?.syncState.recentFailures ?? []).filter(
+    (entry) => entry.phase === 'syncing_labels' && entry.githubIssueNumber === 31
+  );
+  assert.equal(failuresForClosedIssue.length, 1, 'exactly one counted label failure for the issue');
+  assert.equal(labelErrorLogs(run.harness).length, 1);
+});
+
+test('worker keeps skipping and continuing when a label create fails with a non-auth error', async () => {
+  const createdLabelIds = new Map<string, string>();
+  const { harness, createAttempts } = await runLabelCreateFailureSync({
+    issueCount: 1,
+    labelNames: ['area:one', 'area:two', 'area:three'],
+    createLabelResponse: (labelName) =>
+      labelName === 'area:one'
+        ? jsonResponse({ error: 'Internal error.' }, 500)
+        : jsonResponse({
+            id: createdLabelIds.get(labelName) ?? (createdLabelIds.set(labelName, `00000000-0000-0000-0000-00000000010${createdLabelIds.size + 1}`), createdLabelIds.get(labelName)),
+            companyId: 'company-1',
+            name: labelName,
+            color: '#d73a4a',
+            createdAt: '2026-04-09T10:05:00.000Z',
+            updatedAt: '2026-04-09T10:05:00.000Z'
+          })
+  });
+
+  // The first pass tries every label even though the first one failed with a 500. Later passes of the
+  // same run may retry, which is the existing behavior and is not asserted here.
+  assert.deepEqual(createAttempts.slice(0, 3), ['area:one', 'area:two', 'area:three']);
+  assert.equal(labelErrorLogs(harness).length, 0);
+
+  // Not denied, so the labels that could be created were actually applied to the imported issue.
+  const imported = (await harness.ctx.issues.list({ companyId: 'company-1' }))[0];
+  assert.deepEqual(
+    [...(imported?.labelIds ?? [])].sort(),
+    [createdLabelIds.get('area:two'), createdLabelIds.get('area:three')].sort()
+  );
+});
+
+test('worker leaves existing issue labels untouched after the first access denial', async () => {
+  const keepLabel = {
+    id: '00000000-0000-0000-0000-0000000000a1',
+    companyId: 'company-1',
+    name: 'area:keep',
+    color: '#d73a4a',
+    createdAt: '2026-04-09T10:00:00.000Z',
+    updatedAt: '2026-04-09T10:00:00.000Z'
+  };
+  const otherLabel = { ...keepLabel, id: '00000000-0000-0000-0000-0000000000a2', name: 'area:other' };
+  const updates: Array<{ issueId: string; labelIds?: string[] }> = [];
+  const updatesAtRunEnd: number[] = [];
+
+  const run = await runLabelCreateFailureSync({
+    issueCount: 2,
+    // Run 0 imports both issues with area:keep. Run 1 asks issue 30 for a missing label (the denied create) and
+    // issue 31 for area:other, which is cached in the directory, so only a stopped label phase keeps it untouched.
+    labelNames: (runIndex, number) =>
+      runIndex === 0 ? ['area:keep'] : number === 30 ? ['area:keep', 'area:new'] : ['area:other'],
+    createLabelResponse: (labelName, runIndex) =>
+      runIndex === 0 && labelName === 'area:keep'
+        ? jsonResponse(keepLabel)
+        : jsonResponse({ error: 'Board access required.' }, 401),
+    listLabelsResponse: (_index, runIndex) => jsonResponse(runIndex === 0 ? [] : [keepLabel, otherLabel]),
+    runs: 2,
+    afterRun: (runIndex) => {
+      updatesAtRunEnd[runIndex] = updates.length;
+    },
+    onHarness: (harness) => {
+      const originalUpdate = harness.ctx.issues.update;
+      harness.ctx.issues.update = (async (issueId: string, patch: { labelIds?: string[] }, companyId: string) => {
+        updates.push({ issueId, labelIds: patch.labelIds });
+        return originalUpdate(issueId, patch as never, companyId);
+      }) as typeof harness.ctx.issues.update;
+    }
+  });
+
+  const issues = await run.harness.ctx.issues.list({ companyId: 'company-1' });
+  assert.equal(issues.length, 2);
+  for (const issue of issues) {
+    assert.deepEqual(issue.labelIds, [keepLabel.id], `Expected ${issue.title} to keep its labels`);
+  }
+  // Only the run-0 import may touch labels; after the denial no update carries an empty or cached label set.
+  const afterRun0 = updates.slice(updatesAtRunEnd[0] ?? 0);
+  assert.deepEqual(
+    afterRun0.filter((entry) => entry.labelIds !== undefined),
+    [],
+    `Unexpected label updates after the denial: ${JSON.stringify(afterRun0)}`
+  );
+  assert.equal(labelErrorLogs(run.harness).length, 1);
+  const secondRunFailures = new Set(
+    run.syncs[1]?.syncState.recentFailures?.filter((entry) => entry.phase === 'syncing_labels').map((entry) => entry.githubIssueNumber)
+  );
+  assert.deepEqual([...secondRunFailures].sort(), [...run.issueNumbers].sort());
 });
 
 test('worker resyncs imported issue descriptions when the GitHub body changes later', async () => {
