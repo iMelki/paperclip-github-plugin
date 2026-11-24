@@ -20212,6 +20212,58 @@ test('worker blocks the label phase when the list after a failed create is rejec
   assert.ok((syncs[0]?.syncState.erroredIssuesCount ?? 0) >= issueNumbers.length);
 });
 
+test('worker reports stale labels as a failed sync, without touching them, while the label phase is blocked', async () => {
+  const keepLabel = {
+    id: '00000000-0000-0000-0000-0000000000b1',
+    companyId: 'company-1',
+    name: 'area:keep',
+    color: '#d73a4a',
+    createdAt: '2026-04-09T10:00:00.000Z',
+    updatedAt: '2026-04-09T10:00:00.000Z'
+  };
+  const otherLabel = { ...keepLabel, id: '00000000-0000-0000-0000-0000000000b2', name: 'area:other' };
+  const updates: Array<{ issueId: string; labelIds?: string[] }> = [];
+  const updatesAtRunEnd: number[] = [];
+
+  const run = await runLabelCreateFailureSync({
+    issueCount: 2,
+    // Run 0 imports both issues with two labels. In run 1 issue 30 asks for a missing label (denied create, which
+    // blocks the phase) and GitHub has removed every label from issue 31.
+    labelNames: (runIndex, number) =>
+      runIndex === 0 ? ['area:keep', 'area:other'] : number === 30 ? ['area:keep', 'area:other', 'area:new'] : [],
+    createLabelResponse: (labelName, runIndex) =>
+      runIndex === 0
+        ? jsonResponse(labelName === 'area:keep' ? keepLabel : otherLabel)
+        : jsonResponse({ error: 'Board access required.' }, 401),
+    listLabelsResponse: (_index, runIndex) => jsonResponse(runIndex === 0 ? [] : [keepLabel, otherLabel]),
+    runs: 2,
+    afterRun: (runIndex) => {
+      updatesAtRunEnd[runIndex] = updates.length;
+    },
+    onHarness: (harness) => {
+      const originalUpdate = harness.ctx.issues.update;
+      harness.ctx.issues.update = (async (issueId: string, patch: { labelIds?: string[] }, companyId: string) => {
+        updates.push({ issueId, labelIds: patch.labelIds });
+        return originalUpdate(issueId, patch as never, companyId);
+      }) as typeof harness.ctx.issues.update;
+    }
+  });
+
+  const issues = await run.harness.ctx.issues.list({ companyId: 'company-1' });
+  const staleIssue = issues.find((issue) => issue.title === 'Label failure issue 31');
+  assert.ok(staleIssue);
+  assert.deepEqual([...(staleIssue?.labelIds ?? [])].sort(), [keepLabel.id, otherLabel.id].sort());
+  assert.deepEqual(
+    updates.slice(updatesAtRunEnd[0] ?? 0).filter((entry) => entry.labelIds !== undefined),
+    []
+  );
+  const failedIssues = new Set(
+    run.syncs[1]?.syncState.recentFailures?.filter((entry) => entry.phase === 'syncing_labels').map((entry) => entry.githubIssueNumber)
+  );
+  assert.ok(failedIssues.has(31), 'Expected the stale-label issue to be reported as a failed label sync');
+  assert.equal(labelErrorLogs(run.harness).length, 1);
+});
+
 test('worker keeps skipping and continuing when a label create fails with a non-auth error', async () => {
   const createdLabelIds = new Map<string, string>();
   const { harness, createAttempts } = await runLabelCreateFailureSync({

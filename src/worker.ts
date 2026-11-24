@@ -785,7 +785,11 @@ class PaperclipLabelSyncError extends Error {
     const failure = params.failure;
     const labelList = labelNames.map((value) => `"${value}"`).join(', ');
     const labelSubject =
-      labelNames.length === 1 ? `the GitHub label ${labelList}` : `the GitHub labels ${labelList}`;
+      labelNames.length === 0
+        ? 'the labels of this issue'
+        : labelNames.length === 1
+          ? `the GitHub label ${labelList}`
+          : `the GitHub labels ${labelList}`;
     const location = params.paperclipApiBaseUrl ? ` at ${params.paperclipApiBaseUrl}` : '';
 
     let message: string;
@@ -13727,9 +13731,12 @@ async function synchronizePaperclipIssueLabels(
   if (blockBefore) {
     // After the first access denial no label operation runs for the rest of the run: not even an update from
     // cached labels, so an issue's existing labels are never replaced or cleared. The skip is counted as a failure.
-    if (githubIssue.labels.length === 0) {
+    if (githubIssue.labels.length === 0 && doPaperclipIssueLabelsMatch(paperclipIssue, [])) {
+      // Nothing to map and nothing stale to remove: the issue's labels already equal the desired empty set.
       return false;
     }
+    // Otherwise the labels cannot be reconciled while blocked (including stale labels GitHub removed), so the
+    // issue is reported as a failed label sync and its labels stay untouched.
     throw new PaperclipLabelSyncError({
       labelNames: githubIssue.labels.map((label) => label.name),
       paperclipApiBaseUrl,
